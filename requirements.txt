@@ -1,14 +1,114 @@
-Flask==2.2.5
-gunicorn==20.1.0
-moviepy
-numpy==1.25.0
-librosa==0.10.0
-pydub==0.25.1
-gTTS==2.4.6
+# ===============================
+# ⚙️ CORE Framework
+# ===============================
+fastapi==0.115.0
+uvicorn==0.30.6
+Flask==3.0.3
+Werkzeug==3.0.3
+itsdangerous==2.2.0
+click==8.1.7
+waitress==3.0.0
+
+# ===============================
+# 🌿 Database + ORM
+# ===============================
+SQLAlchemy==2.0.25
+Flask-SQLAlchemy==3.1.1
+firebase-admin==6.5.0
+
+# ===============================
+# 🤖 AI + Voice + Text Processing
+# ===============================
+openai==1.12.0
+gTTS==2.5.1
 textblob==0.17.1
-Pillow==9.5.0
-firebase-admin==6.1.0
-requests==2.31.0
-python-dotenv==1.0.0
-werkzeug==2.2.3
-cachetools==5.4.0
+SpeechRecognition==3.10.1
+pydub==0.25.1
+typing_extensions==4.12.2
+stripe==9.10.0
+librosa==0.10.2
+soundfile==0.12.1
+scipy==1.13.1
+
+# ===============================
+# 🎞️ Video + Audio Rendering
+# ===============================
+moviepy==1.0.3
+imageio==2.34.0
+imageio-ffmpeg==0.5.1
+opencv-python-headless==4.10.0.84
+Pillow==10.3.0
+numpy==1.26.4
+
+# ===============================
+# 📦 Background Task + Cache
+# ===============================
+redis==5.0.4
+rq==1.16.2
+
+# ===============================
+# ☁️ Cloud Integration (AWS/GCS)
+# ===============================
+boto3==1.34.19
+google-cloud-storage==2.16.0
+requests==2.32.3
+
+# ===============================
+# 🛠 Utility + Logging + Time
+# ===============================
+python-dotenv==1.0.1
+uuid==1.30
+datetime==5.5
+pyyaml==6.0.2
+tqdm==4.66.5
+
+# ===============================
+# 🔐 Security & Auth
+# ===============================
+PyJWT==2.8.0
+cryptography==43.0.1
+
+# ===============================
+# 🧑‍💻 Developer Tools
+# ===============================
+autopep8==2.3.2
+reindent==3.5.1
+
+# ===============================
+# 🧩 Compatibility Fixes
+# ===============================
+setuptools==75.2.0
+packaging==24.1
+open3d==0.17.0
+prometheus-client==0.20.0
+
+# ===============================
+# 🔥 AI Models + Torch (CPU Safe)
+# ===============================
+torch==2.3.1+cpu
+torchvision==0.18.1+cpu
+torchaudio==2.3.1+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# ===============================
+# 🎤 ElevenLabs Voice API (Optional)
+# ===============================
+elevenlabs==1.5.0
+
+# ===============================
+# 🎨 Fountain Engine + Upload
+# ===============================
+opencv-python-headless==4.10.0.84
+Pillow==10.3.0
+requests==2.32.3
+python-multipart==0.0.9
+
+# ===============================
+# ✍️ Text Generation + Thumbnail
+# ===============================
+transformers==4.37.2
+huggingface-hub==0.20.3
+
+# ===============================
+# ✅ END OF REQUIREMENTS
+# ===============================
