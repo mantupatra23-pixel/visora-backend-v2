@@ -1,0 +1,6 @@
+video_path = generate_cinematic_video(script)
+return jsonify({
+    "status": True,
+    "message": "Real video generated!",
+    "video_url": "/" + video_path
+})
