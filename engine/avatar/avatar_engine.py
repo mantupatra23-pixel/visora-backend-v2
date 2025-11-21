@@ -1,33 +1,70 @@
 import os
-import uuid
+import random
 from gtts import gTTS
 
-# -----------------------------
-# SIMPLE AVATAR ENGINE (V2 SAFE)
-# -----------------------------
+# ---- IMPORTS FIXED ----
+from engine.facegen.face_generator import generate_face
+from engine.fullbody.fullbody_engine import generate_fullbody_avatar
+from engine.avatar.motion_engine import generate_motion_avatar
+from engine.mixer.template_mixer import mix_avatar_with_template
+from engine.voiceclone.clone_engine import clone_voice_and_generate
+from engine.reel.reel_engine import generate_reel
 
-def generate_talking_avatar(script_text, gender="any", user_face=None, mode="fullbody"):
 
-    # 1) Generate audio
-    audio_id = str(uuid.uuid4())[:8]
-    audio_path = f"static/videos/audio_{audio_id}.mp3"
+def generate_talking_avatar(
+        script_text,
+        gender="any",
+        emotion="normal",
+        user_face=None,
+        mode="fullbody",
+        apply_template=False,
+        bg_template=None
+    ):
+    
+    # ------------------------------
+    # 1) GENERATE FACE
+    # ------------------------------
+    if user_face:
+        face_img = user_face
+    else:
+        face_img = generate_face(gender)
 
-    # Generate TTS audio
-    tts = gTTS(script_text)
-    tts.save(audio_path)
+    # ------------------------------
+    # 2) GENERATE/CLONE VOICE
+    # ------------------------------
+    voice_sample = "static/uploads/voice_sample.wav"
 
-    # 2) Generate a placeholder video (real engine later)
-    video_id = str(uuid.uuid4())[:8]
-    video_path = f"static/videos/avatar_{video_id}.mp4"
+    if os.path.exists(voice_sample):
+        audio_path = clone_voice_and_generate(script_text, voice_sample)
+    else:
+        rnd = random.randint(1000, 9999)
+        audio_path = f"static/videos/voice_{rnd}.mp3"
+        gTTS(script_text).save(audio_path)
 
-    # Create fake video file for now
-    with open(video_path, "wb") as f:
-        f.write(b"FAKE_AVATAR_VIDEO_DATA")
+    # ------------------------------
+    # 3) GENERATE AVATAR VIDEO
+    # ------------------------------
+    if mode == "fullbody":
+        avatar_video = generate_fullbody_avatar(face_img, audio_path)
+    else:
+        avatar_video = generate_motion_avatar(face_img, audio_path)
 
-    # 3) Return final output
-    return {
-        "audio_path": audio_path,
-        "video_path": video_path,
-        "status": True,
-        "message": "Avatar video generated (placeholder)"
-    }
+    # ------------------------------
+    # 4) OPTIONAL TEMPLATE MIXING
+    # ------------------------------
+    if apply_template and bg_template:
+        final_video = mix_avatar_with_template(avatar_video, bg_template)
+
+    # ------------------------------
+    # 5) AUTO REEL EDITOR
+    # ------------------------------
+    elif mode == "reel":
+        final_video = generate_reel(avatar_video, script_text)
+
+    # ------------------------------
+    # 6) DEFAULT RETURN
+    # ------------------------------
+    else:
+        final_video = avatar_video
+
+    return final_video
