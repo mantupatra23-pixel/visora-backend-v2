@@ -1,0 +1,29 @@
+# .github/workflows/ci-cd.yml (summary)
+name: CI/CD
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and push web image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.web
+          push: true
+          tags: ghcr.io/yourorg/visora-web:${{ github.sha }}
+      - name: Build and push worker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: true
+          tags: ghcr.io/yourorg/visora-worker:${{ github.sha }}
+      - name: Deploy (Render/GKE/ECS)
+        run: |
+          # Call a deploy script or API. For Render use their CLI, for k8s use kubectl.

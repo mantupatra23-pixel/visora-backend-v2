@@ -1,0 +1,9 @@
+{
+  "default_scene_templates": [
+    {"bg":"engine/templates/cinematic_bg/1.mp4","transition":"crossfade","camera":"smooth","angle":"left","duration":6,"music_style":"cinematic"},
+    {"bg":"engine/templates/cinematic_bg/2.mp4","transition":"whip","camera":"pan-right","angle":"center","duration":6,"music_style":"cinematic"},
+    {"bg":"engine/templates/cinematic_bg/3.mp4","transition":"zoom","camera":"zoom-in","angle":"right","duration":6,"music_style":"cinematic"}
+  ],
+  "transitions": ["crossfade","whip","zoom","wipe","dip_to_black"],
+  "scene_templates_count": 3
+}

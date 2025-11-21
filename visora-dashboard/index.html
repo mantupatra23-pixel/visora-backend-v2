@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VISORA STUDIO</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {
+    font-family: Poppins, sans-serif;
+    background:#0f0f0f;
+    color:white;
+    margin:0;
+    padding:20px;
+}
+.container {
+    max-width: 600px;
+    margin: auto;
+    padding: 20px;
+    background:#1a1a1a;
+    border-radius:16px;
+    box-shadow:0 0 20px rgba(0,0,0,0.6);
+}
+label { font-weight:600; margin-top:10px; display:block; }
+input, select, textarea {
+    width:100%;
+    padding:12px;
+    border-radius:10px;
+    border:none;
+    margin-top:5px;
+    background:#2a2a2a;
+    color:white;
+}
+button {
+    width:100%;
+    padding:14px;
+    margin-top:20px;
+    font-weight:700;
+    border:none;
+    border-radius:10px;
+    background:#ff007a;
+    color:white;
+    cursor:pointer;
+    font-size:16px;
+}
+button:hover { background:#ff0fa5; }
+
+#resultSection {
+    margin-top:20px;
+    display:none;
+}
+video {
+    width:100%;
+    border-radius:12px;
+    margin-top:10px;
+}
+.loader {
+    display:none;
+    margin-top:20px;
+    text-align:center;
+    font-size:18px;
+}
+</style>
+</head>
+<body>
+
+<div class="container">
+    <h2>VISORA STUDIO</h2>
+    <p>AI Avatar • Outfit • Background • Voice • Reel • Multi-Scene</p>
+
+    <label>Script</label>
+    <textarea id="script"></textarea>
+
+    <label>Face Image</label>
+    <input type="file" id="face">
+
+    <label>Voice Sample (optional)</label>
+    <input type="file" id="voice">
+
+    <label>Outfit</label>
+    <select id="outfit">
+        <option value="none">None</option>
+        <option value="suit">Suit</option>
+        <option value="hoodie">Hoodie</option>
+        <option value="kurta">Kurta</option>
+        <option value="saree">Saree</option>
+    </select>
+
+    <label>Mode</label>
+    <select id="mode">
+        <option value="fullbody">Full Body</option>
+        <option value="head">Headshot</option>
+        <option value="reel">Reel Mode</option>
+        <option value="ai_bg">AI Background Video</option>
+        <option value="multiscene">Multi-Scene</option>
+    </select>
+
+    <button onclick="generate()">Generate Video</button>
+
+    <div class="loader" id="loader">Processing… Please wait 🔥</div>
+
+    <div id="resultSection">
+        <h3>Generated Video</h3>
+        <video id="resultVideo" controls></video>
+        <a id="downloadBtn" download>
+            <button style="background:#00d26a;">Download Video</button>
+        </a>
+    </div>
+</div>
+
+<script>
+async function generate() {
+    document.getElementById("loader").style.display = "block";
+    document.getElementById("resultSection").style.display = "none";
+
+    let form = new FormData();
+    form.append("script", document.getElementById("script").value);
+    form.append("mode", document.getElementById("mode").value);
+    form.append("outfit", document.getElementById("outfit").value);
+
+    let faceFile = document.getElementById("face").files[0];
+    if (faceFile) form.append("face", faceFile);
+
+    let voiceFile = document.getElementById("voice").files[0];
+    if (voiceFile) form.append("file", voiceFile);
+
+    // Voice upload first
+    if (voiceFile) {
+        await fetch("YOUR_BACKEND_URL/upload-voice", {
+            method: "POST",
+            body: form
+        });
+    }
+
+    // Avatar generate
+    let resp = await fetch("YOUR_BACKEND_URL/talking-avatar", {
+        method: "POST",
+        body: form
+    });
+
+    let data = await resp.json();
+
+    document.getElementById("loader").style.display = "none";
+    document.getElementById("resultSection").style.display = "block";
+
+    let videoURL = data.video_url;
+
+    document.getElementById("resultVideo").src = videoURL;
+    document.getElementById("downloadBtn").href = videoURL;
+}
+</script>
+
+</body>
+</html>

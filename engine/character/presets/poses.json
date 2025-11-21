@@ -1,0 +1,108 @@
+{
+  "poses": [
+    {
+      "id": "pose_stand",
+      "name": "Standing",
+      "keypoints": {
+        "head": [0.5, 0.1],
+        "left_hand": [0.3, 0.45],
+        "right_hand": [0.7, 0.45],
+        "left_leg": [0.45, 0.85],
+        "right_leg": [0.55, 0.85]
+      }
+    },
+    {
+      "id": "pose_sit",
+      "name": "Sitting",
+      "keypoints": {
+        "head": [0.5, 0.15],
+        "left_hand": [0.35, 0.4],
+        "right_hand": [0.65, 0.4],
+        "left_leg": [0.45, 0.7],
+        "right_leg": [0.55, 0.7]
+      }
+    },
+    {
+      "id": "pose_run",
+      "name": "Running",
+      "keypoints": {
+        "head": [0.5, 0.1],
+        "left_hand": [0.25, 0.45],
+        "right_hand": [0.75, 0.4],
+        "left_leg": [0.4, 0.85],
+        "right_leg": [0.6, 0.8]
+      }
+    },
+    {
+      "id": "pose_walk",
+      "name": "Walking",
+      "keypoints": {
+        "head": [0.5, 0.1],
+        "left_hand": [0.3, 0.45],
+        "right_hand": [0.7, 0.45],
+        "left_leg": [0.42, 0.85],
+        "right_leg": [0.58, 0.85]
+      }
+    },
+    {
+      "id": "pose_jump",
+      "name": "Jumping",
+      "keypoints": {
+        "head": [0.5, 0.08],
+        "left_hand": [0.3, 0.35],
+        "right_hand": [0.7, 0.35],
+        "left_leg": [0.45, 0.9],
+        "right_leg": [0.55, 0.9]
+      }
+    },
+    {
+      "id": "pose_dance",
+      "name": "Dancing",
+      "keypoints": {
+        "head": [0.5, 0.12],
+        "left_hand": [0.25, 0.3],
+        "right_hand": [0.75, 0.5],
+        "left_leg": [0.42, 0.85],
+        "right_leg": [0.58, 0.78]
+      }
+    },
+    {
+      "id": "pose_fight",
+      "name": "Fighting",
+      "keypoints": {
+        "head": [0.5, 0.1],
+        "left_hand": [0.2, 0.4],
+        "right_hand": [0.8, 0.35],
+        "left_leg": [0.4, 0.85],
+        "right_leg": [0.6, 0.75]
+      }
+    },
+    {
+      "id": "pose_relax",
+      "name": "Relax Position",
+      "keypoints": {
+        "head": [0.5, 0.12],
+        "left_hand": [0.35, 0.5],
+        "right_hand": [0.65, 0.5],
+        "left_leg": [0.45, 0.9],
+        "right_leg": [0.55, 0.9]
+      }
+    },
+    {
+      "id": "pose_yoga",
+      "name": "Yoga",
+      "keypoints": {
+        "head": [0.5, 0.09],
+        "left_hand": [0.25, 0.35],
+        "right_hand": [0.75, 0.35],
+        "left_leg": [0.45, 0.88],
+        "right_leg": [0.55, 0.88]
+      }
+    },
+    {
+      "id": "pose_custom",
+      "name": "Custom Pose",
+      "keypoints": {}
+    }
+  ]
+}
