@@ -170,6 +170,68 @@ def replicate_generate_video(prompt, timeout_seconds=POLL_TIMEOUT, **kwargs):
         app.logger.exception("Replicate request error: %s", e)
         return None
 
+# ---------------- Replicate real engine ----------------
+def generate_replicate_video(script_text, max_scenes=1, timeout_seconds=300):
+    """
+    Generate a video using Replicate predictions.
+    Returns absolute local path to saved mp4 or None on failure.
+    """
+    try:
+        token = REPLICATE_API_TOKEN
+        model = REPLICATE_MODEL_VIDEO
+        if not token or not model:
+            app.logger.error("REPLICATE_API_TOKEN or REPLICATE_MODEL_VIDEO not configured")
+            return None
+
+        client = replicate.Client(api_token=token)
+
+        # create prediction
+        prediction = client.predictions.create(
+            model=model,
+            input={
+                "prompt": script_text,
+                "max_scenes": max_scenes
+            }
+        )
+
+        # wait for completion (blocks)
+        prediction.wait()
+
+        # get output URL (prediction.output might be list)
+        out = prediction.output
+        if isinstance(out, list) and len(out) > 0:
+            out_item = out[0]
+        else:
+            out_item = out
+
+        # if dict with url
+        if isinstance(out_item, dict):
+            url = out_item.get("url") or out_item.get("uri") or out_item.get("output") 
+        else:
+            url = str(out_item)
+
+        if not url:
+            app.logger.error("No usable download URL from replicate prediction")
+            return None
+
+        # download asset
+        os.makedirs(VIDEO_SAVE_DIR, exist_ok=True)
+        fname = f"replicate_{uuid.uuid4().hex[:8]}.mp4"
+        save_path = os.path.join(VIDEO_SAVE_DIR, fname)
+
+        dl = requests.get(url, stream=True, timeout=60)
+        dl.raise_for_status()
+        with open(save_path, "wb") as f:
+            for chunk in dl.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        return save_path
+
+    except Exception as e:
+        app.logger.exception("Replicate video generate error: %s", e)
+        return None
+
 # --------------- ROUTES ----------------
 @app.route("/", methods=["GET"])
 def home():
@@ -180,35 +242,44 @@ def home():
 def test():
     return jsonify({"msg": "Backend test route working!"})
 
-
-# ---------------- Generic create-video (main cinematic) -------------
+# ------------------ REAL GPU create-video ------------------
 @app.route("/create-video", methods=["POST"])
 def create_video():
     try:
-        data = request.form if request.form else (request.get_json(silent=True) or {})
-        script = data.get("script", "") if isinstance(data, dict) else ""
-        if not script or str(script).strip() == "":
-            return jsonify({"status": False, "error": "Script text required"}), 400
+        script = request.form.get("script", "")
+        max_scenes = int(request.form.get("max_scenes", 1))
 
-        max_scenes = int(data.get("max_scenes", 1)) if isinstance(data, dict) else 1
+        if not script.strip():
+            return jsonify({"status": False, "error": "Script is missing"}), 400
 
-        # choose model - prefer specific env or fallback to general video model
-        model = REPLICATE_MODEL_VIDEO
-        if not model:
-            return jsonify({"status": False, "error": "REPLICATE_MODEL_VIDEO not configured"}), 500
+        app.logger.info("Trying Replicate GPU engine for video generation...")
 
-        extra_inputs = {"fps": 12, "width": 512, "height": 768, "motion": "cinematic", "max_scenes": max_scenes}
-        video_fullpath = replicate_generate_with_model(model, script, extra_inputs)
-        if not video_fullpath:
+        # Try real GPU engine
+        video_path = generate_replicate_video(
+            script_text=script,
+            max_scenes=max_scenes
+        )
+
+        # Fallback
+        if not video_path:
+            app.logger.warning("GPU engine failed, using fallback dummy engine...")
+            video_path = _dummy_generate_cinematic_video(script)
+
+        if not video_path:
             return jsonify({"status": False, "error": "Video generation failed"}), 500
 
-        fname = os.path.basename(video_fullpath)
+        fname = os.path.basename(video_path)
         rel = f"/static/videos/{fname}"
-        return jsonify({"status": True, "video_url": rel})
+
+        return jsonify({
+            "status": True,
+            "message": "Video created successfully",
+            "video_url": rel
+        })
+
     except Exception as e:
         app.logger.exception("create_video error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
-
 
 # ---------------- 10-scene cinematic movie ----------------
 @app.route("/generate-movie", methods=["POST"])
