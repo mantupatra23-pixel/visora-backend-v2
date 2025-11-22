@@ -206,6 +206,43 @@ def serve_video(filename):
         return send_file(path)
     return jsonify({"error": "file not found"}), 404
 
+@app.route("/create-video", methods=["POST"])
+def create_video():
+    try:
+        script_text = request.form.get("script", "").strip()
+        max_scenes = int(request.form.get("max_scenes", 1))
+
+        if not script_text:
+            return jsonify({"error": "Script is required"}), 400
+
+        # HF MODEL TOKEN USE
+        if HF_MODEL and HF_TOKEN:
+            import requests
+
+            hf_api = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+
+            payload = {"inputs": script_text}
+
+            hf_resp = requests.post(hf_api, json=payload, headers=headers)
+
+            if hf_resp.status_code != 200:
+                return jsonify({
+                    "error": "HF model failed",
+                    "details": hf_resp.text
+                }), 500
+
+            return jsonify({
+                "status": "success",
+                "engine": "huggingface",
+                "result": hf_resp.json()
+            })
+
+        return jsonify({"error": "HF_MODEL or HF_TOKEN not configured"}), 500
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
     # for local debug only
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
