@@ -58,103 +58,104 @@ def _save_uploaded_file(file_obj, subfolder="uploads", prefix="file"):
     file_obj.save(save_path)
     return os.path.join("static", subfolder, save_name)
 
+# ----------- REPLICATE GPU ENGINE (real video generator) -------------
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
+# FORCE override model (env को ignore करे)
+REPLICATE_MODEL_VERSION = "minimax/hailuo-2.3"
 
-# ---------- REPLICATE GPU ENGINE (real video generator) ----------
-REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "").strip()
-REPLICATE_MODEL_VERSION = os.environ.get("REPLICATE_MODEL_VERSION", "").strip()  # e.g. "zsxk/animate-v3:541b496c..."
-POLL_INTERVAL = float(os.environ.get("REPLICATE_POLL_INTERVAL", 2.0))
+POLL_INTERVAL = float(os.environ.get("REPLICATE_POLL_INTERVAL", 3))
 POLL_TIMEOUT = int(os.environ.get("REPLICATE_POLL_TIMEOUT", 300))
 
 def replicate_generate_video(prompt, timeout_seconds=POLL_TIMEOUT, **kwargs):
     """
-    Create a video using Replicate predictions API and return local saved file path
+    Create a video using Replicate predictions API and return saved file path
     (absolute path) or None on failure.
     """
+
     if not REPLICATE_API_TOKEN:
-        app.logger.warning("No REPLICATE_API_TOKEN set - cannot call Replicate.")
+        app.logger.warning("No REPLICATE_API_TOKEN set - cannot run GPU engine")
         return None
 
-    # Build model string (model:version or just model)
-    model_ref = REPLICATE_MODEL_VERSION or kwargs.get("model") or ""
+    # Build model string
+    model_ref = REPLICATE_MODEL_VERSION or kwargs.get("model")
     if not model_ref:
-        app.logger.error("REPLICATE_MODEL_VERSION not configured.")
+        app.logger.error("REPLICATE_MODEL_VERSION not configured")
         return None
 
     try:
         # init client
         client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-        # build input payload - add prompt and any other fields your chosen model accepts
+        # build input payload - add prompt and any other fields
         payload = {
             "prompt": prompt,
         }
-        # allow override / additions
         payload.update(kwargs.get("input", {}))
 
-        app.logger.info("Creating Replicate prediction for model=%s", model_ref)
-        # create prediction (predictions.create used for more control)
+        app.logger.info(f"Creating Replicate prediction for model={model_ref}")
+
         prediction = client.predictions.create(
             model=model_ref,
             input=payload,
-            # you can pass webhook or version-specific fields here if needed
         )
 
         start = time.time()
         while True:
-            # reload to get latest status
             prediction = client.predictions.get(prediction.id)
-            status = prediction.status  # starting, processing, succeeded, failed, canceled
+            status = prediction.status
             app.logger.debug("Replicate status=%s", status)
+
             if status == "succeeded":
                 break
             if status in ("failed", "canceled"):
-                app.logger.error("Replicate job failed/canceled: %s", getattr(prediction, "error", None))
+                app.logger.error("Replicate job failed/canceled")
                 return None
             if time.time() - start > timeout_seconds:
                 app.logger.error("Replicate job timed out after %s seconds", timeout_seconds)
                 return None
+
             time.sleep(POLL_INTERVAL)
 
         # succeeded -> get output
         output = getattr(prediction, "output", None)
         if not output:
-            app.logger.error("Replicate returned no output for prediction %s", prediction.id)
+            app.logger.error("Replicate returned no output for prompt")
             return None
 
-        # output can be list or single item. take first url/string
-        out_item = output[0] if isinstance(output, (list, tuple)) and len(output) else output
-        # out_item could be a url or dict with "url"
+        # output can be list or single item. take first
+        out_item = output[0] if isinstance(output, (list, tuple)) else output
+
+        # out_item could be a url or dict with url
         if isinstance(out_item, dict):
-            url = out_item.get("url") or out_item.get("uri") or str(out_item)
+            url = out_item.get("url") or out_item.get("uri")
         else:
             url = str(out_item)
 
         if not url:
-            app.logger.error("No usable download url from replicate output: %s", out_item)
+            app.logger.error("No usable download url from replicate output")
             return None
 
         # download asset
         try:
             dl = requests.get(url, stream=True, timeout=30)
             dl.raise_for_status()
-            # detect extension (fallback to .mp4)
+
+            # fallback extension
             ext = ".mp4"
             if "content-type" in dl.headers:
                 ctype = dl.headers.get("content-type", "")
                 if "audio" in ctype and "mp3" in ctype:
                     ext = ".mp3"
                 elif "video" in ctype:
-                    if "mp4" in ctype: ext = ".mp4"
-                    elif "quicktime" in ctype: ext = ".mov"
-            # else try to find extension from url
-            if "." in url.split("?")[0].split("/")[-1]:
-                possible = os.path.splitext(url.split("?")[0])[1]
-                if possible:
-                    ext = possible
+                    if "mp4" in ctype:
+                        ext = ".mp4"
+                    elif "quicktime" in ctype:
+                        ext = ".mov"
 
             fname = f"replicate_{uuid.uuid4().hex[:8]}{ext}"
             save_path = os.path.join(BASE_DIR, VIDEO_SAVE_DIR, fname)
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
             with open(save_path, "wb") as f:
                 for chunk in dl.iter_content(chunk_size=8192):
                     if chunk:
@@ -163,7 +164,7 @@ def replicate_generate_video(prompt, timeout_seconds=POLL_TIMEOUT, **kwargs):
             return save_path
 
         except Exception as e:
-            app.logger.exception("Failed downloading replicate output: %s", e)
+            app.logger.exception("Failed downloading replicate file: %s", e)
             return None
 
     except Exception as e:
