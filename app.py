@@ -1,196 +1,225 @@
 # app.py
+"""
+FastAPI service to create videos using Replicate predictions API.
+Environment variables used:
+  REPLICATE_API_TOKEN        -> your replicate API token (required)
+  REPLICATE_MODEL_VERSION    -> model reference, e.g. "anotherjesse/zeroscope-v2-xl:9f747673" or "minimax/hailuo-2.3" (recommended include version if required)
+  REPLICATE_POLL_INTERVAL    -> seconds between polls (default 3)
+  REPLICATE_POLL_TIMEOUT     -> total seconds timeout for prediction (default 300)
+  VIDEO_SAVE_DIR             -> directory to save downloaded videos (default "./videos")
+"""
+
 import os
+import time
 import uuid
-import shutil
-import subprocess
-from pathlib import Path
-from flask import Flask, request, jsonify, send_file
-from gtts import gTTS
-from PIL import Image, ImageDraw, ImageFont
+import logging
+from typing import Optional
 
-app = Flask(__name__)
+import requests
+from fastapi import FastAPI, Form, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-# Config
-VIDEO_SAVE_DIR = os.environ.get("VIDEO_SAVE_DIR", "/tmp/videos")
-IMAGE_SIZE = (1080, 1920)  # vertical 9:16
-BG_COLOR = (18, 18, 18)
-TEXT_COLOR = (255, 255, 255)
-FONT_SIZE = 72
-LINE_HEIGHT = 80
+# Attempt to import replicate; if not installed, the app will error on startup
+try:
+    import replicate
+except Exception as e:
+    replicate = None
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("visora_replicate")
+
+# Config from env
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "").strip()
+REPLICATE_MODEL_VERSION = os.environ.get("REPLICATE_MODEL_VERSION", "").strip()
+POLL_INTERVAL = int(os.environ.get("REPLICATE_POLL_INTERVAL", "3"))
+POLL_TIMEOUT = int(os.environ.get("REPLICATE_POLL_TIMEOUT", "300"))
+VIDEO_SAVE_DIR = os.environ.get("VIDEO_SAVE_DIR", "./videos")
 
 os.makedirs(VIDEO_SAVE_DIR, exist_ok=True)
 
-def text_to_sentences(text):
-    # Basic split by sentences (.,?,!) fallback
-    if not text:
-        return []
-    import re
-    parts = re.split(r'(?<=[\.\?\!])\s+', text.strip())
-    parts = [p.strip() for p in parts if p.strip()]
-    # if only 1 long part, try split by newline or commas
-    if len(parts) == 1:
-        if '\n' in parts[0]:
-            parts = [p.strip() for p in parts[0].split('\n') if p.strip()]
-        elif ',' in parts[0] and len(parts[0]) > 180:
-            parts = [p.strip() for p in parts[0].split(',') if p.strip()]
-    # cap number of slides to reasonable amount
-    if len(parts) > 20:
-        parts = parts[:20]
-    return parts
+app = FastAPI(title="Visora Replicate Video API")
 
-def make_slide(text, out_path):
-    img = Image.new("RGB", IMAGE_SIZE, color=BG_COLOR)
-    draw = ImageDraw.Draw(img)
-    # try to load a decent TTF, fallback to default
-    font = None
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", FONT_SIZE)
-    except Exception:
-        font = ImageFont.load_default()
-    # wrap text
-    import textwrap
-    max_width = 20  # tuned for default font; if using truetype will fit better
-    if isinstance(font, ImageFont.FreeTypeFont):
-        # compute wrap width by measuring
-        max_px = IMAGE_SIZE[0] - 160
-        words = text.split()
-        lines = []
-        cur = ""
-        for w in words:
-            test = (cur + " " + w).strip()
-            w_px = draw.textsize(test, font=font)[0]
-            if w_px <= max_px:
-                cur = test
-            else:
-                if cur:
-                    lines.append(cur)
-                cur = w
-        if cur:
-            lines.append(cur)
-    else:
-        lines = textwrap.wrap(text, width=max_width)
-    # compute vertical position
-    total_h = len(lines) * LINE_HEIGHT
-    y = (IMAGE_SIZE[1] - total_h) // 2
-    for line in lines:
-        w, h = draw.textsize(line, font=font)
-        x = (IMAGE_SIZE[0] - w) // 2
-        draw.text((x, y), line, font=font, fill=TEXT_COLOR)
-        y += LINE_HEIGHT
-    img.save(out_path)
+class CreateVideoResponse(BaseModel):
+    status: bool
+    message: str
+    video_path: Optional[str] = None
+    prediction_id: Optional[str] = None
 
-def tts_save(text, out_mp3):
-    tts = gTTS(text=text, lang="en")
-    tts.save(out_mp3)
+def _validate_config():
+    if not REPLICATE_API_TOKEN:
+        raise RuntimeError("REPLICATE_API_TOKEN not set")
+    if not REPLICATE_MODEL_VERSION:
+        raise RuntimeError("REPLICATE_MODEL_VERSION not set")
 
-def get_audio_duration(path):
-    # use ffprobe to get duration
-    try:
-        cmd = [
-            "ffprobe", "-v", "error", "-show_entries",
-            "format=duration", "-of",
-            "default=noprint_wrappers=1:nokey=1", path
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return float(res.stdout.strip())
-    except Exception:
-        return None
+def _init_client():
+    if replicate is None:
+        raise RuntimeError("replicate python package not installed")
+    return replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-def make_video_from_images(image_files, durations, out_video):
-    tmp_dir = os.path.dirname(out_video)
-    # create short videos per image
-    tmp_videos = []
-    for idx, (img, dur) in enumerate(zip(image_files, durations)):
-        tmp_mp4 = os.path.join(tmp_dir, f"seg_{idx:03d}.mp4")
-        cmd = [
-            "ffmpeg", "-y", "-loop", "1", "-i", img,
-            "-c:v", "libx264", "-t", str(dur), "-pix_fmt", "yuv420p",
-            "-vf", f"scale={IMAGE_SIZE[0]}:{IMAGE_SIZE[1]}", tmp_mp4
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        tmp_videos.append(tmp_mp4)
-    # create concat file
-    concat_txt = os.path.join(tmp_dir, "videos.txt")
-    with open(concat_txt, "w") as f:
-        for v in tmp_videos:
-            f.write(f"file '{v}'\n")
-    # concat
-    cmd_concat = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", out_video]
-    subprocess.run(cmd_concat, check=True, capture_output=True)
-    # cleanup tmp segment files
-    for v in tmp_videos:
-        os.remove(v)
-    os.remove(concat_txt)
+def _download_file(url: str, dest_dir: str, prefix: str = "replicate") -> str:
+    """Download URL to dest_dir and return saved file path."""
+    resp = requests.get(url, stream=True, timeout=30)
+    resp.raise_for_status()
 
-@app.route("/create-video", methods=["POST"])
-def create_video():
+    # choose extension from content-type if possible
+    ctype = resp.headers.get("content-type", "")
+    ext = ".mp4"
+    if "audio" in ctype and "mp3" in ctype:
+        ext = ".mp3"
+    elif "video" in ctype:
+        if "quicktime" in ctype:
+            ext = ".mov"
+        else:
+            ext = ".mp4"
+
+    fname = f"{prefix}_{uuid.uuid4().hex[:8]}{ext}"
+    save_path = os.path.join(dest_dir, fname)
+    with open(save_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+    return save_path
+
+@app.post("/create-video", response_model=CreateVideoResponse)
+def create_video(
+    script: str = Form(...),
+    max_scenes: Optional[int] = Form(1),
+):
     """
-    POST form fields:
-    - script : main text (required)
-    - filename (optional)
+    Create a video using Replicate. Returns JSON with saved video path OR error.
+    Example curl:
+    curl -X POST "https://your-host/create-video" -F "script=Hello" -F "max_scenes=1"
     """
-    script = request.form.get("script") or request.json.get("script") if request.is_json else None
-    if not script or not script.strip():
-        return jsonify({"error": "script required", "status": False}), 400
-
-    job_id = uuid.uuid4().hex[:12]
-    workdir = Path(VIDEO_SAVE_DIR) / job_id
-    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        _validate_config()
+    except RuntimeError as e:
+        logger.error("Config error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
     try:
-        # 1) split into sentences/slides
-        slides = text_to_sentences(script)
-        if not slides:
-            slides = [script.strip()]
-
-        # 2) create images
-        image_files = []
-        for i, s in enumerate(slides):
-            img_path = str(workdir / f"img_{i:03d}.png")
-            make_slide(s, img_path)
-            image_files.append(img_path)
-
-        # 3) TTS -> single audio file
-        audio_path = str(workdir / "audio.mp3")
-        # use full script for audio (or join slides)
-        tts_save(" ".join(slides), audio_path)
-
-        # 4) get audio duration
-        audio_duration = get_audio_duration(audio_path) or max(3 * len(image_files), 5)
-
-        # 5) compute durations per slide
-        per = audio_duration / len(image_files)
-        durations = [per] * len(image_files)
-
-        # 6) build video from images
-        raw_video = str(workdir / "video_no_audio.mp4")
-        final_video = str(workdir / (request.form.get("filename") or f"{job_id}.mp4"))
-        make_video_from_images(image_files, durations, raw_video)
-
-        # 7) merge audio
-        cmd_merge = [
-            "ffmpeg", "-y", "-i", raw_video, "-i", audio_path,
-            "-c:v", "copy", "-c:a", "aac", "-shortest", final_video
-        ]
-        subprocess.run(cmd_merge, check=True, capture_output=True)
-
-        # remove raw_video
-        if os.path.exists(raw_video):
-            os.remove(raw_video)
-
-        return jsonify({"status": True, "video": str(final_video), "job_id": job_id})
-    except subprocess.CalledProcessError as e:
-        return jsonify({"status": False, "error": "ffmpeg failed", "details": e.stderr.decode() if e.stderr else str(e)}), 500
+        client = _init_client()
     except Exception as e:
-        return jsonify({"status": False, "error": str(e)}), 500
+        logger.exception("Failed to init replicate client")
+        raise HTTPException(status_code=500, detail="Replicate client init failed")
 
-@app.route("/download/<job_id>/<fname>", methods=["GET"])
-def download(job_id, fname):
-    path = Path(VIDEO_SAVE_DIR) / job_id / fname
-    if not path.exists():
-        return jsonify({"error": "file not found"}), 404
-    return send_file(path, as_attachment=True)
+    # Build input payload for model - adapt fields to model API
+    payload = {
+        "prompt": script,
+        "max_scenes": int(max_scenes),
+    }
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))o
+    # If users set model string as "owner/model:version" it's used directly
+    model_ref = REPLICATE_MODEL_VERSION
 
+    logger.info("Creating prediction for model=%s", model_ref)
+    try:
+        prediction = client.predictions.create(
+            version=model_ref if ":" in model_ref or "/" in model_ref else model_ref,
+            input=payload,
+        )
+    except replicate.exceptions.ReplicateError as e:
+        logger.exception("Replicate API error")
+        return JSONResponse(status_code=500, content={
+            "status": False,
+            "message": f"Replicate API error: {e}",
+            "prediction_id": None,
+            "video_path": None
+        })
+    except Exception as e:
+        logger.exception("Unexpected error creating prediction")
+        raise HTTPException(status_code=500, detail="Failed to create prediction")
+
+    prediction_id = getattr(prediction, "id", None) or str(uuid.uuid4())
+    logger.info("Prediction started id=%s", prediction_id)
+
+    # Poll loop
+    start_time = time.time()
+    while True:
+        try:
+            prediction = client.predictions.get(prediction.id)
+        except Exception as e:
+            logger.exception("Failed to get prediction status")
+            return JSONResponse(status_code=500, content={
+                "status": False,
+                "message": "Failed to fetch prediction status",
+                "prediction_id": prediction_id,
+                "video_path": None
+            })
+        status = getattr(prediction, "status", None)
+        logger.debug("prediction status=%s", status)
+
+        if status == "succeeded":
+            break
+        if status in ("failed", "canceled", "cancelled"):
+            logger.error("Replicate job failed or canceled: %s", status)
+            return JSONResponse(status_code=500, content={
+                "status": False,
+                "message": f"Replicate job failed: {status}",
+                "prediction_id": prediction_id,
+                "video_path": None
+            })
+        if time.time() - start_time > POLL_TIMEOUT:
+            logger.error("Replicate job timed out")
+            return JSONResponse(status_code=500, content={
+                "status": False,
+                "message": "Replicate job timed out",
+                "prediction_id": prediction_id,
+                "video_path": None
+            })
+        time.sleep(POLL_INTERVAL)
+
+    # Get output field
+    output = getattr(prediction, "output", None)
+    if not output:
+        logger.error("No output from replicate")
+        return JSONResponse(status_code=500, content={
+            "status": False,
+            "message": "No output from replicate",
+            "prediction_id": prediction_id,
+            "video_path": None
+        })
+
+    # output may be list or single item
+    out_item = output[0] if isinstance(output, (list, tuple)) else output
+    # out_item might be dict with url or direct url string
+    url = None
+    if isinstance(out_item, dict):
+        url = out_item.get("url") or out_item.get("uri")
+    else:
+        url = str(out_item)
+
+    if not url:
+        logger.error("No downloadable url in output")
+        return JSONResponse(status_code=500, content={
+            "status": False,
+            "message": "No downloadable URL",
+            "prediction_id": prediction_id,
+            "video_path": None
+        })
+
+    # Download result
+    try:
+        saved = _download_file(url, VIDEO_SAVE_DIR, prefix="replicate_video")
+    except Exception as e:
+        logger.exception("Failed to download result")
+        return JSONResponse(status_code=500, content={
+            "status": False,
+            "message": f"Failed to download result: {e}",
+            "prediction_id": prediction_id,
+            "video_path": None
+        })
+
+    logger.info("Saved video to %s", saved)
+    return {
+        "status": True,
+        "message": "OK",
+        "prediction_id": prediction_id,
+        "video_path": saved
+    }
+
+# Health check
+@app.get("/health")
+def health():
+    return {"status": "ok"}
