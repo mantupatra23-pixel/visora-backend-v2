@@ -263,7 +263,7 @@ def create_video():
         # Fallback
         if not video_path:
             app.logger.warning("GPU engine failed, using fallback dummy engine...")
-            video_path = _dummy_generate_cinematic_video(script)
+            video_path = replicate_generate_video(script)
 
         if not video_path:
             return jsonify({"status": False, "error": "Video generation failed"}), 500
