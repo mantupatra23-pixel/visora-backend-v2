@@ -10,6 +10,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
+import replicate
 
 load_dotenv()
 
@@ -58,100 +59,116 @@ def _save_uploaded_file(file_obj, subfolder="uploads", prefix="file"):
     return os.path.join("static", subfolder, save_name)
 
 
-# ------------- REPLICATE HELPERS -------------
-def replicate_start_prediction(model_version: str, input_payload: dict, timeout_seconds: int = 30):
-    """Start a replicate prediction job and return job dict or None"""
+# ---------- REPLICATE GPU ENGINE (real video generator) ----------
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "").strip()
+REPLICATE_MODEL_VERSION = os.environ.get("REPLICATE_MODEL_VERSION", "").strip()  # e.g. "zsxk/animate-v3:541b496c..."
+POLL_INTERVAL = float(os.environ.get("REPLICATE_POLL_INTERVAL", 2.0))
+POLL_TIMEOUT = int(os.environ.get("REPLICATE_POLL_TIMEOUT", 300))
+
+def replicate_generate_video(prompt, timeout_seconds=POLL_TIMEOUT, **kwargs):
+    """
+    Create a video using Replicate predictions API and return local saved file path
+    (absolute path) or None on failure.
+    """
     if not REPLICATE_API_TOKEN:
-        app.logger.error("REPLICATE_API_TOKEN missing.")
+        app.logger.warning("No REPLICATE_API_TOKEN set - cannot call Replicate.")
         return None
-    headers = {
-        "Authorization": f"Token {REPLICATE_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {"version": model_version, "input": input_payload}
+
+    # Build model string (model:version or just model)
+    model_ref = REPLICATE_MODEL_VERSION or kwargs.get("model") or ""
+    if not model_ref:
+        app.logger.error("REPLICATE_MODEL_VERSION not configured.")
+        return None
+
     try:
-        r = requests.post("https://api.replicate.com/v1/predictions", headers=headers, json=payload, timeout=timeout_seconds)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        app.logger.exception("Failed to start replicate prediction: %s", e)
-        return None
+        # init client
+        client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
+        # build input payload - add prompt and any other fields your chosen model accepts
+        payload = {
+            "prompt": prompt,
+        }
+        # allow override / additions
+        payload.update(kwargs.get("input", {}))
 
-def replicate_poll_and_download(job_id: str, timeout_seconds: int = 300, poll_interval: int = 2):
-    """Poll replicate job until success and download first output asset to VIDEO_SAVE_DIR. Returns absolute path or None."""
-    headers = {"Authorization": f"Token {REPLICATE_API_TOKEN}"}
-    status_url = f"https://api.replicate.com/v1/predictions/{job_id}"
-    start = time.time()
-    while time.time() - start < timeout_seconds:
+        app.logger.info("Creating Replicate prediction for model=%s", model_ref)
+        # create prediction (predictions.create used for more control)
+        prediction = client.predictions.create(
+            model=model_ref,
+            input=payload,
+            # you can pass webhook or version-specific fields here if needed
+        )
+
+        start = time.time()
+        while True:
+            # reload to get latest status
+            prediction = client.predictions.get(prediction.id)
+            status = prediction.status  # starting, processing, succeeded, failed, canceled
+            app.logger.debug("Replicate status=%s", status)
+            if status == "succeeded":
+                break
+            if status in ("failed", "canceled"):
+                app.logger.error("Replicate job failed/canceled: %s", getattr(prediction, "error", None))
+                return None
+            if time.time() - start > timeout_seconds:
+                app.logger.error("Replicate job timed out after %s seconds", timeout_seconds)
+                return None
+            time.sleep(POLL_INTERVAL)
+
+        # succeeded -> get output
+        output = getattr(prediction, "output", None)
+        if not output:
+            app.logger.error("Replicate returned no output for prediction %s", prediction.id)
+            return None
+
+        # output can be list or single item. take first url/string
+        out_item = output[0] if isinstance(output, (list, tuple)) and len(output) else output
+        # out_item could be a url or dict with "url"
+        if isinstance(out_item, dict):
+            url = out_item.get("url") or out_item.get("uri") or str(out_item)
+        else:
+            url = str(out_item)
+
+        if not url:
+            app.logger.error("No usable download url from replicate output: %s", out_item)
+            return None
+
+        # download asset
         try:
-            s = requests.get(status_url, headers=headers, timeout=30)
-            s.raise_for_status()
-            status = s.json()
+            dl = requests.get(url, stream=True, timeout=30)
+            dl.raise_for_status()
+            # detect extension (fallback to .mp4)
+            ext = ".mp4"
+            if "content-type" in dl.headers:
+                ctype = dl.headers.get("content-type", "")
+                if "audio" in ctype and "mp3" in ctype:
+                    ext = ".mp3"
+                elif "video" in ctype:
+                    if "mp4" in ctype: ext = ".mp4"
+                    elif "quicktime" in ctype: ext = ".mov"
+            # else try to find extension from url
+            if "." in url.split("?")[0].split("/")[-1]:
+                possible = os.path.splitext(url.split("?")[0])[1]
+                if possible:
+                    ext = possible
+
+            fname = f"replicate_{uuid.uuid4().hex[:8]}{ext}"
+            save_path = os.path.join(BASE_DIR, VIDEO_SAVE_DIR, fname)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, "wb") as f:
+                for chunk in dl.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            return save_path
+
         except Exception as e:
-            app.logger.exception("Error polling replicate job: %s", e)
+            app.logger.exception("Failed downloading replicate output: %s", e)
             return None
 
-        state = status.get("status")
-        if state == "succeeded":
-            output = status.get("output")
-            if not output:
-                app.logger.error("Replicate succeeded but no output: %s", status)
-                return None
-            out_item = output[0] if isinstance(output, list) else output
-            if isinstance(out_item, dict):
-                url = out_item.get("url") or out_item.get("uri") or out_item.get("download_url")
-            else:
-                url = str(out_item)
-            if not url:
-                app.logger.error("No download URL in replicate output: %s", out_item)
-                return None
-            # download
-            try:
-                dl = requests.get(url, stream=True, timeout=60)
-                dl.raise_for_status()
-                # detect extension
-                base = url.split("?", 1)[0]
-                possible_ext = os.path.splitext(base)[1]
-                ext = possible_ext if possible_ext else ".mp4"
-                fname = f"replicate_{uuid.uuid4().hex[-8:]}{ext}"
-                save_path = os.path.join(VIDEO_SAVE_DIR, fname)
-                with open(save_path, "wb") as f:
-                    for chunk in dl.iter_content(chunk_size=32768):
-                        if chunk:
-                            f.write(chunk)
-                return os.path.abspath(save_path)
-            except Exception as e:
-                app.logger.exception("Failed to download replicate asset: %s", e)
-                return None
-
-        if state in ("failed", "canceled", "cancelled"):
-            app.logger.error("Replicate job state: %s, details: %s", state, status)
-            return None
-
-        time.sleep(poll_interval)
-
-    app.logger.error("Replicate job timed out after %s sec (job %s)", timeout_seconds, job_id)
-    return None
-
-
-def replicate_generate_with_model(model_version: str, prompt: str, extra_inputs: dict = None):
-    """Convenience wrapper: start job + poll + download. Returns absolute filepath or None."""
-    if not model_version:
-        app.logger.error("No model_version provided for replicate call.")
+    except Exception as e:
+        app.logger.exception("Replicate request error: %s", e)
         return None
-    input_payload = {"prompt": prompt}
-    if extra_inputs:
-        input_payload.update(extra_inputs)
-    job = replicate_start_prediction(model_version, input_payload)
-    if not job:
-        return None
-    job_id = job.get("id")
-    if not job_id:
-        app.logger.error("Replicate returned no job id.")
-        return None
-    return replicate_poll_and_download(job_id)
-
 
 # --------------- ROUTES ----------------
 @app.route("/", methods=["GET"])

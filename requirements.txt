@@ -30,6 +30,7 @@ stripe==9.10.0
 librosa==0.10.2
 soundfile==0.12.1
 scipy==1.13.1
+replicate>=0.9.0
 
 # ===============================
 # 🎞️ Video + Audio Rendering
@@ -113,3 +114,4 @@ huggingface-hub==0.20.3
 # ===============================
 # ✅ END OF REQUIREMENTS
 # ===============================
+replicate>=0.9.0
