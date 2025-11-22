@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
-# app.py - Visora backend (clean, production-safe)
-# Author: Aimantuvya & GPT-5 (starter)
+# app.py - Visora backend (clean, production safe)
+# Author: Aimantuvya & GPT-5 (assistant)
 # Usage: python app.py  (or run via gunicorn/uvicorn in production)
 
 import os
+import io
 import json
 import uuid
+import time
+import requests
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
+# load environment from .env (on Render you set env variables via dashboard)
 load_dotenv()
 
 # ---------- CONFIG ----------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 VIDEO_SAVE_DIR = os.environ.get("VIDEO_SAVE_DIR", os.path.join(BASE_DIR, "static", "videos"))
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(BASE_DIR, "static", "uploads"))
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "wav", "mp3", "mp4", "ogg"}
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "wav", "mp3", "ogg", "webm", "mp4"}
 
+# Ensure dirs exist
 os.makedirs(VIDEO_SAVE_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__, static_folder=os.path.join(BASE_DIR, "static"))
 
-# ---------- Try import real engines, else dummy fallbacks ----------
+# ---------- Dummy generators (fallbacks) ----------
 def _dummy_generate_cinematic_video(script_text="", **kw):
-    # create tiny fake file so clients can download/test
+    """Create a tiny fake mp4 so clients can download/test when real engine not available."""
     fname = f"video_{uuid.uuid4().hex[:8]}.mp4"
     path = os.path.join(VIDEO_SAVE_DIR, fname)
     with open(path, "wb") as f:
@@ -46,14 +51,13 @@ def _dummy_generate_movie(**kw):
     return _dummy_generate_cinematic_video("movie")
 
 def _dummy_generate_music(**kw):
-    # returns relative path to generated mp3
     fname = f"music_{uuid.uuid4().hex[:8]}.mp3"
     path = os.path.join(VIDEO_SAVE_DIR, fname)
     with open(path, "wb") as f:
         f.write(b"FAKE_MUSIC")
     return path
 
-# Attempt to import engines - if not present, use dummy functions
+# ---------- Try import real engines (if present) ----------
 try:
     from engine.video_engine import generate_cinematic_video
 except Exception:
@@ -84,8 +88,115 @@ try:
 except Exception:
     render_music = _dummy_generate_music
 
+# ---------- REPLICATE GPU ENGINE (real video generator) ----------
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
+REPLICATE_MODEL_VERSION = os.environ.get("REPLICATE_MODEL_VERSION", "zskx/animate-v3:541b496c618b0c9b92")  # default placeholder
+
+def replicate_generate_video(prompt, timeout_seconds=300, poll_interval=2):
+    """
+    Create a video using Replicate's predictions API.
+    Returns: local saved file path (absolute) OR None on failure.
+    """
+    if not REPLICATE_API_TOKEN:
+        app.logger.warning("No REPLICATE_API_TOKEN set - replicate_generate_video skipped")
+        return None
+
+    headers = {
+        "Authorization": f"Token {REPLICATE_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    # payload structure depends on model. Here we use a general pattern - adjust as model requires.
+    payload = {
+        "version": REPLICATE_MODEL_VERSION,
+        "input": {
+            "prompt": prompt,
+            # other model-specific fields
+            "fps": 12,
+            "width": 512,
+            "height": 768,
+            "motion": "cinematic",
+        }
+    }
+
+    try:
+        r = requests.post("https://api.replicate.com/v1/predictions", headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        job = r.json()
+        job_id = job.get("id")
+        if not job_id:
+            app.logger.error("Replicate returned no job id: %s", job)
+            return None
+
+        # poll
+        start = time.time()
+        while time.time() - start < timeout_seconds:
+            status_resp = requests.get(f"https://api.replicate.com/v1/predictions/{job_id}", headers=headers, timeout=30)
+            status_resp.raise_for_status()
+            status = status_resp.json()
+            state = status.get("status")
+            # states: starting, processing, succeeded, failed, canceled
+            if state == "succeeded":
+                output = status.get("output")
+                if not output:
+                    app.logger.error("Replicate succeeded but returned no output: %s", status)
+                    return None
+
+                # output could be a list of URLs or dicts - handle common shapes
+                out_item = None
+                if isinstance(output, list) and len(output) > 0:
+                    out_item = output[0]
+                else:
+                    out_item = output
+
+                # if out_item is dict with 'url' or 'uri'
+                if isinstance(out_item, dict):
+                    url = out_item.get("url") or out_item.get("uri") or out_item.get("download_url")
+                else:
+                    url = str(out_item)
+
+                if not url:
+                    app.logger.error("No usable download URL in replicate output: %s", out_item)
+                    return None
+
+                # Download asset
+                try:
+                    dl = requests.get(url, stream=True, timeout=60)
+                    dl.raise_for_status()
+                    ext = ".mp4"
+                    # try to detect extension from url
+                    if "." in url.split("?")[0]:
+                        possible_ext = os.path.splitext(url.split("?")[0])[1]
+                        if possible_ext:
+                            ext = possible_ext
+                    fname = f"replicate_{uuid.uuid4().hex[:8]}{ext}"
+                    save_path = os.path.join(VIDEO_SAVE_DIR, fname)
+                    with open(save_path, "wb") as f:
+                        for chunk in dl.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    return save_path
+                except Exception as e:
+                    app.logger.exception("Failed downloading replicate output: %s", e)
+                    return None
+
+            if state in ("failed", "canceled"):
+                app.logger.error("Replicate job failed/canceled: %s", status)
+                return None
+
+            time.sleep(poll_interval)
+
+        app.logger.error("Replicate job timeout (%s s) for job id %s", timeout_seconds, job_id)
+        return None
+
+    except Exception as e:
+        app.logger.exception("Replicate request error: %s", e)
+        return None
+
 # ---------- UTIL ----------
 def allowed_file(filename):
+    if not filename:
+        return False
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def _save_uploaded_file(file_obj, subfolder="uploads", prefix="file"):
@@ -95,14 +206,13 @@ def _save_uploaded_file(file_obj, subfolder="uploads", prefix="file"):
     if not filename:
         return None
     ext = os.path.splitext(filename)[1]
-    file_id = uuid.uuid4().hex[:8]
+    file_id = uuid.uuid4().hex[-8:]
     save_name = f"{prefix}_{file_id}{ext}"
     dest_dir = os.path.join(BASE_DIR, "static", subfolder)
     os.makedirs(dest_dir, exist_ok=True)
     save_path = os.path.join(dest_dir, save_name)
     file_obj.save(save_path)
-    rel_path = os.path.join("static", subfolder, save_name)  # relative path for response
-    return rel_path
+    return os.path.join("static", subfolder, save_name)
 
 # ---------- ROUTES ----------
 @app.route("/", methods=["GET"])
@@ -120,7 +230,7 @@ def create_video():
         data = request.form if request.form else (request.get_json(silent=True) or {})
         script = data.get("script", "") if isinstance(data, dict) else ""
         if not script or str(script).strip() == "":
-            return jsonify({"status": False, "error": "Script required"}), 400
+            return jsonify({"status": False, "error": "Script text missing"}), 400
 
         # optional face upload
         face_file = request.files.get("face")
@@ -128,89 +238,57 @@ def create_video():
         if face_file and allowed_file(face_file.filename):
             face_path = _save_uploaded_file(face_file, subfolder="uploads", prefix="face")
 
-        # call engine
-        video_fullpath = generate_cinematic_video(script_text=script, user_face=face_path, options=data)
-        # Normalize return: engine may return full path or relative
+        # Try Replicate GPU engine first
+        video_fullpath = None
+        video_fullpath = replicate_generate_video(script)
+        if not video_fullpath:
+            # fallback to local engine (if present)
+            try:
+                video_fullpath = generate_cinematic_video(script_text=script, face_path=face_path)
+            except Exception as e:
+                app.logger.exception("Local engine failed, using dummy: %s", e)
+                video_fullpath = _dummy_generate_cinematic_video(script)
+
         if os.path.isabs(video_fullpath) and os.path.exists(video_fullpath):
             fname = os.path.basename(video_fullpath)
             rel = f"/static/videos/{fname}"
         else:
-            # assume engine returned relative inside static
-            rel = video_fullpath if isinstance(video_fullpath, str) else ""
-        return jsonify({"status": True, "message": "Video generated successfully", "video_url": rel})
-    except Exception as e:
-        return jsonify({"status": False, "error": str(e)}), 500
+            # assume it's already a relative path
+            rel = video_fullpath
 
-# Talking avatar
-@app.route("/talking-avatar", methods=["POST"])
-def talking_avatar():
-    try:
-        data = request.form if request.form else (request.get_json(silent=True) or {})
-        script = data.get("script", "")
-        gender = data.get("gender", "any")
-        emotion = data.get("emotion", "neutral")
-        mode = data.get("mode", "fullbody")
-
-        # optional face file
-        user_face = request.files.get("face")
-        user_face_path = None
-        if user_face and allowed_file(user_face.filename):
-            user_face_path = _save_uploaded_file(user_face, subfolder="uploads", prefix="face")
-
-        filename = generate_talking_avatar(script_text=script, gender=gender, emotion=emotion, user_face=user_face_path, mode=mode)
-        if os.path.isabs(filename):
-            fname = os.path.basename(filename)
-            rel = f"/static/videos/{fname}"
-        else:
-            rel = filename
         return jsonify({"status": True, "video_url": rel})
     except Exception as e:
+        app.logger.exception("create_video error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
-# Multiscene avatar
-@app.route("/multiscene-avatar", methods=["POST"])
-def multiscene_avatar():
-    try:
-        data = request.form if request.form else (request.get_json(silent=True) or {})
-        script = data.get("script", "")
-        gender = data.get("gender", "any")
-        emotion = data.get("emotion", "neutral")
-        user_face = request.files.get("face")
-        face_path = None
-        if user_face and allowed_file(user_face.filename):
-            face_path = _save_uploaded_file(user_face, subfolder="uploads", prefix="face")
-        filename = generate_multiscene_video(script_text=script, gender=gender, emotion=emotion, user_face=face_path, options=data)
-        if os.path.isabs(filename):
-            fname = os.path.basename(filename)
-            rel = f"/static/videos/{fname}"
-        else:
-            rel = filename
-        return jsonify({"status": True, "video_url": rel})
-    except Exception as e:
-        return jsonify({"status": False, "error": str(e)}), 500
-
-# Generate movie (10-scene / cinematic)
+# Generate 10-scene cinematic movie
 @app.route("/generate-movie", methods=["POST"])
 def generate_movie():
     try:
         data = request.form if request.form else (request.get_json(silent=True) or {})
         script = data.get("script", "")
         if not script:
-            return jsonify({"status": False, "error": "script required"}), 400
+            return jsonify({"status": False, "error": "script missing"}), 400
+
         face_file = request.files.get("face")
         face_path = None
         if face_file and allowed_file(face_file.filename):
             face_path = _save_uploaded_file(face_file, subfolder="uploads", prefix="face")
+
         max_scenes = int(data.get("max_scenes", 6))
-        # Use 10-scene engine if available
-        filename = generate_10scene_movie(script_text=script, user_face=face_path, max_scenes=max_scenes, options=data)
-        if os.path.isabs(filename):
-            fname = os.path.basename(filename)
-            rel = f"/static/videos/{fname}"
+        # prefer 10-scene engine if available
+        try:
+            filename = generate_10scene_movie(script_text=script, max_scenes=max_scenes, face_path=face_path)
+        except Exception:
+            filename = _dummy_generate_movie(script)
+
+        if os.path.isabs(filename) and os.path.exists(filename):
+            rel = f"/static/videos/{os.path.basename(filename)}"
         else:
             rel = filename
         return jsonify({"status": True, "movie_url": rel})
     except Exception as e:
+        app.logger.exception("generate_movie error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
 # Fullbody generate (main)
@@ -220,20 +298,25 @@ def generate_fullbody():
         data = request.form if request.form else (request.get_json(silent=True) or {})
         script = data.get("script", "")
         if not script:
-            return jsonify({"status": False, "error": "script required"}), 400
+            return jsonify({"status": False, "error": "script missing"}), 400
+
         face_file = request.files.get("face")
         face_path = None
         if face_file and allowed_file(face_file.filename):
             face_path = _save_uploaded_file(face_file, subfolder="uploads", prefix="face")
-        # call fullbody engine
-        out_video = generate_fullbody_animation(script_text=script, face_img_path=face_path, options=data)
-        if os.path.isabs(out_video):
-            fname = os.path.basename(out_video)
-            rel = f"/static/videos/{fname}"
+
+        try:
+            out_video = generate_fullbody_animation(script_text=script, face_path=face_path)
+        except Exception:
+            out_video = _dummy_generate_fullbody_animation(script)
+
+        if os.path.isabs(out_video) and os.path.exists(out_video):
+            rel = f"/static/videos/{os.path.basename(out_video)}"
         else:
             rel = out_video
         return jsonify({"status": True, "video_url": rel})
     except Exception as e:
+        app.logger.exception("generate_fullbody error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
 # Fullbody motion quick endpoint
@@ -242,18 +325,22 @@ def fullbody_motion():
     try:
         face = request.files.get("face")
         if not face:
-            return jsonify({"status": False, "error": "face file required"}), 400
+            return jsonify({"status": False, "error": "face missing"}), 400
         face_path = _save_uploaded_file(face, subfolder="uploads", prefix="face")
         style = request.form.get("style", "fortnite")
         preset = request.form.get("preset", "dance")
-        final_video = generate_fullbody_animation(face_img_path=face_path, style=style, preset=preset)
-        if os.path.isabs(final_video):
-            fname = os.path.basename(final_video)
-            rel = f"/static/videos/{fname}"
+        try:
+            final_video = generate_fullbody_animation(face_img_path=face_path, style=style, preset=preset)
+        except Exception:
+            final_video = _dummy_generate_fullbody_animation(style)
+
+        if os.path.isabs(final_video) and os.path.exists(final_video):
+            rel = f"/static/videos/{os.path.basename(final_video)}"
         else:
             rel = final_video
         return jsonify({"status": True, "video_url": rel})
     except Exception as e:
+        app.logger.exception("fullbody_motion error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
 # Generate music (procedural / replicate or local)
@@ -264,20 +351,21 @@ def api_generate_music():
         duration = float(data.get("duration", 12))
         bpm = int(data.get("bpm", 90))
         style = data.get("style", "cinematic")
-        # attempt to use cloud/replicate if flagged - fallback local
         use_cloud = str(data.get("cloud", "false")).lower() == "true"
-        if use_cloud:
-            # if you implement replicate, call it here
-            mp = render_music(duration=duration, bpm=bpm, style=style, cloud=True)
+
+        if use_cloud and REPLICATE_API_TOKEN:
+            # For now call local render_music or fallback (you can implement replicate music if model available)
+            mp = render_music(duration=duration, bpm=bpm, style=style)
         else:
             mp = render_music(duration=duration, bpm=bpm, style=style)
-        if os.path.isabs(mp):
-            fname = os.path.basename(mp)
-            rel = f"/static/videos/{fname}"
+
+        if os.path.isabs(mp) and os.path.exists(mp):
+            rel = f"/static/videos/{os.path.basename(mp)}"
         else:
             rel = mp
         return jsonify({"status": True, "music_path": rel})
     except Exception as e:
+        app.logger.exception("generate_music error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
 # Generate SFX (simple)
@@ -286,15 +374,14 @@ def api_generate_sfx():
     try:
         data = request.get_json(silent=True) or request.form or {}
         kind = data.get("kind", "whoosh")
-        duration = float(data.get("duration", 1.0))
-        # For now use dummy generated file
-        fname = f"sfx_{kind}_{uuid.uuid4().hex[:6]}.wav"
+        fname = f"sfx_{kind}_{uuid.uuid4().hex[:8]}.wav"
         path = os.path.join(VIDEO_SAVE_DIR, fname)
         with open(path, "wb") as f:
             f.write(b"FAKE_SFX")
         rel = f"/static/videos/{fname}"
         return jsonify({"status": True, "sfx_path": rel})
     except Exception as e:
+        app.logger.exception("generate_sfx error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
 # Mix audio (voice + music + sfx)
@@ -305,56 +392,55 @@ def api_mix_audio():
         music_file = request.files.get("music")
         sfx_file = request.files.get("sfx")
         if not voice_file:
-            return jsonify({"status": False, "error": "voice file required"}), 400
+            return jsonify({"status": False, "error": "voice missing"}), 400
+
         voice_path = _save_uploaded_file(voice_file, subfolder="uploads", prefix="voice")
-        music_path = None
-        sfx_path = None
-        if music_file:
-            music_path = _save_uploaded_file(music_file, subfolder="uploads", prefix="music")
-        if sfx_file:
-            sfx_path = _save_uploaded_file(sfx_file, subfolder="uploads", prefix="sfx")
-        # For demo create a fake mixed file
+        music_path = _save_uploaded_file(music_file, subfolder="uploads", prefix="music") if music_file else None
+        sfx_path = _save_uploaded_file(sfx_file, subfolder="uploads", prefix="sfx") if sfx_file else None
+
         fname = f"mixed_{uuid.uuid4().hex[:8]}.wav"
         path = os.path.join(VIDEO_SAVE_DIR, fname)
         with open(path, "wb") as f:
             f.write(b"FAKE_MIXED_AUDIO")
-        return jsonify({"status": True, "mixed_path": f"/static/videos/{fname}"})
+        rel = f"/static/videos/{fname}"
+        return jsonify({"status": True, "mixed_path": rel})
     except Exception as e:
+        app.logger.exception("mix_audio error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
-# Upload face helper
+# Upload helpers
 @app.route("/upload-face", methods=["POST"])
 def upload_face():
     try:
         if "file" not in request.files:
-            return jsonify({"status": False, "error": "No file uploaded"}), 400
+            return jsonify({"status": False, "error": "No file part"}), 400
         file = request.files["file"]
         rel = _save_uploaded_file(file, subfolder="uploads", prefix="face")
         if not rel:
-            return jsonify({"status": False, "error": "Empty or invalid file"}), 400
+            return jsonify({"status": False, "error": "Empty filename"}), 400
         return jsonify({"status": True, "face_path": rel})
     except Exception as e:
+        app.logger.exception("upload_face error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
-# Upload voice helper
 @app.route("/upload-voice", methods=["POST"])
 def upload_voice():
     try:
         if "file" not in request.files:
-            return jsonify({"status": False, "error": "No file uploaded"}), 400
+            return jsonify({"status": False, "error": "No file part"}), 400
         file = request.files["file"]
         rel = _save_uploaded_file(file, subfolder="uploads", prefix="voice")
         if not rel:
-            return jsonify({"status": False, "error": "Empty or invalid file"}), 400
-        return jsonify({"status": True, "message": "Voice sample uploaded", "path": rel})
+            return jsonify({"status": False, "error": "Empty filename"}), 400
+        return jsonify({"status": True, "message": "Voice saved", "path": rel})
     except Exception as e:
+        app.logger.exception("upload_voice error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
-# list poses / costumes / hairstyles (examples)
+# List poses/costumes/hairstyles (examples)
 @app.route("/poses", methods=["GET"])
 def api_list_poses():
     try:
-        # replace with real function list_poses()
         poses = ["idle", "walk", "run", "dance", "action"]
         return jsonify({"status": True, "poses": poses})
     except Exception as e:
@@ -373,33 +459,32 @@ def api_list_hairstyles():
 # Serve static videos safely
 @app.route("/static/videos/<path:filename>", methods=["GET"])
 def serve_video(filename):
-    # defensive: prevent path traversal
     safe = secure_filename(filename)
     return send_from_directory(VIDEO_SAVE_DIR, safe)
 
-# ---------- Conversation / Multi-avatar endpoint ----------
+# Conversation / multi-avatar endpoint (simple)
 @app.route("/generate-conversation", methods=["POST"])
 def api_generate_conversation():
     try:
         data = request.form if request.form else (request.get_json(silent=True) or {})
-        script = data.get("script") if isinstance(data, dict) else None
+        script = data.get("script", "")
         if not script:
-            return jsonify({"status": False, "error": "script required"}), 400
-        avatars_raw = data.get("avatars", "{}")
+            return jsonify({"status": False, "error": "script missing"}), 400
+        avatars_raw = data.get("avatars", "[]")
         try:
             avatars = json.loads(avatars_raw) if isinstance(avatars_raw, str) else avatars_raw
         except Exception:
             avatars = {}
-        sync = str(data.get("sync", "false")).lower() == "true"
-        # fallback: run local generation synchronously
-        video = _dummy_generate_multiscene_video(script_text=script, avatars=avatars)
-        if os.path.isabs(video):
-            fname = os.path.basename(video)
-            rel = f"/static/videos/{fname}"
+
+        # Try local generation fallback
+        video = _dummy_generate_multiscene_video(script)
+        if os.path.isabs(video) and os.path.exists(video):
+            rel = f"/static/videos/{os.path.basename(video)}"
         else:
             rel = video
         return jsonify({"status": True, "video_url": rel})
     except Exception as e:
+        app.logger.exception("generate_conversation error: %s", e)
         return jsonify({"status": False, "error": str(e)}), 500
 
 # ---------- RUN ----------
