@@ -9,6 +9,7 @@ itsdangerous==2.2.0
 click==8.1.7
 waitress==3.0.0
 gunicorn==20.1.0
+flask-cors
 
 # ===============================
 # 🌿 Database + ORM
