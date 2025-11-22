@@ -58,117 +58,111 @@ def _save_uploaded_file(file_obj, subfolder="uploads", prefix="file"):
     file_obj.save(save_path)
     return os.path.join("static", subfolder, save_name)
 
-# ----------- REPLICATE GPU ENGINE (real video generator) -------------
-REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
-# FORCE override model (env को ignore करे)
-REPLICATE_MODEL_VERSION = "minimax/hailuo-2.3"
-
+# ----------- REPLICATE GPU ENGINE (real video generator) ------>
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN")
+REPLICATE_MODEL_VERSION = os.environ.get("REPLICATE_MODEL_VERSION", "minimax/hailuo-2.3")
 POLL_INTERVAL = float(os.environ.get("REPLICATE_POLL_INTERVAL", 3))
 POLL_TIMEOUT = int(os.environ.get("REPLICATE_POLL_TIMEOUT", 300))
 
 def replicate_generate_video(prompt, timeout_seconds=POLL_TIMEOUT, **kwargs):
     """
-    Create a video using Replicate predictions API and return saved file path
-    (absolute path) or None on failure.
+    Create a video using Replicate predictions API
+    Returns saved video file path OR None on failure
     """
 
     if not REPLICATE_API_TOKEN:
-        app.logger.warning("No REPLICATE_API_TOKEN set - cannot run GPU engine")
+        app.logger.error("No REPLICATE_API_TOKEN found")
         return None
 
-    # Build model string
-    model_ref = REPLICATE_MODEL_VERSION or kwargs.get("model")
+    # final model reference (no :version needed)
+    model_ref = REPLICATE_MODEL_VERSION
     if not model_ref:
         app.logger.error("REPLICATE_MODEL_VERSION not configured")
         return None
 
     try:
-        # init client
+        # Init client
         client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-        # build input payload - add prompt and any other fields
+        # Input payload
         payload = {
             "prompt": prompt,
         }
         payload.update(kwargs.get("input", {}))
 
-        app.logger.info(f"Creating Replicate prediction for model={model_ref}")
+        app.logger.info(f"Creating Replicate job for: {model_ref}")
 
+        # Create prediction job
         prediction = client.predictions.create(
             model=model_ref,
-            input=payload,
+            input=payload
         )
 
         start = time.time()
+
+        # Poll status
         while True:
             prediction = client.predictions.get(prediction.id)
             status = prediction.status
-            app.logger.debug("Replicate status=%s", status)
 
             if status == "succeeded":
                 break
             if status in ("failed", "canceled"):
-                app.logger.error("Replicate job failed/canceled")
+                app.logger.error(f"Replicate failed: {status}")
                 return None
             if time.time() - start > timeout_seconds:
-                app.logger.error("Replicate job timed out after %s seconds", timeout_seconds)
+                app.logger.error("Replicate job timeout")
                 return None
 
             time.sleep(POLL_INTERVAL)
 
-        # succeeded -> get output
+        # Get output
         output = getattr(prediction, "output", None)
         if not output:
-            app.logger.error("Replicate returned no output for prompt")
+            app.logger.error("No output from Replicate")
             return None
 
-        # output can be list or single item. take first
-        out_item = output[0] if isinstance(output, (list, tuple)) else output
+        # First item if list
+        out_item = output[0] if isinstance(output, (list,tuple)) else output
 
-        # out_item could be a url or dict with url
+        # extract URL
         if isinstance(out_item, dict):
             url = out_item.get("url") or out_item.get("uri")
         else:
             url = str(out_item)
 
         if not url:
-            app.logger.error("No usable download url from replicate output")
+            app.logger.error("No downloadable URL")
             return None
 
-        # download asset
-        try:
-            dl = requests.get(url, stream=True, timeout=30)
-            dl.raise_for_status()
+        # Download video
+        dl = requests.get(url, stream=True, timeout=30)
+        dl.raise_for_status()
 
-            # fallback extension
-            ext = ".mp4"
-            if "content-type" in dl.headers:
-                ctype = dl.headers.get("content-type", "")
-                if "audio" in ctype and "mp3" in ctype:
-                    ext = ".mp3"
-                elif "video" in ctype:
-                    if "mp4" in ctype:
-                        ext = ".mp4"
-                    elif "quicktime" in ctype:
-                        ext = ".mov"
+        ext = ".mp4"
+        ctype = dl.headers.get("content-type","")
 
-            fname = f"replicate_{uuid.uuid4().hex[:8]}{ext}"
-            save_path = os.path.join(BASE_DIR, VIDEO_SAVE_DIR, fname)
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        if "audio" in ctype:
+            ext = ".mp3"
+        elif "video" in ctype:
+            if "quicktime" in ctype:
+                ext = ".mov"
+            else:
+                ext = ".mp4"
 
-            with open(save_path, "wb") as f:
-                for chunk in dl.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+        fname = f"replicate_{uuid.uuid4().hex[:8]}{ext}"
+        save_path = os.path.join(BASE_DIR, VIDEO_SAVE_DIR, fname)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-            return save_path
+        with open(save_path, "wb") as f:
+            for chunk in dl.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
 
-        except Exception as e:
-            app.logger.exception("Failed downloading replicate file: %s", e)
-            return None
+        return save_path
 
     except Exception as e:
-        app.logger.exception("Replicate request error: %s", e)
+        app.logger.exception(f"Replicate exception: {e}")
         return None
 
 # ---------------- Replicate real engine ----------------
