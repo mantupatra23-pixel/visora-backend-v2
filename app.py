@@ -58,53 +58,48 @@ def _save_uploaded_file(file_obj, subfolder="uploads", prefix="file"):
     file_obj.save(save_path)
     return os.path.join("static", subfolder, save_name)
 
-# ----------- REPLICATE GPU ENGINE (real video generator) ------>
+# ---------- REPLICATE GPU ENGINE (real video generator) ----------
+# make sure these env vars exist in Render (or set defaults here)
 REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN")
-REPLICATE_MODEL_VERSION = os.environ.get("REPLICATE_MODEL_VERSION", "minimax/hailuo-2.3")
-POLL_INTERVAL = float(os.environ.get("REPLICATE_POLL_INTERVAL", 3))
+REPLICATE_MODEL_VERSION = os.environ.get("REPLICATE_MODEL_VERSION", "lucataco/haiper-video")
+POLL_INTERVAL = float(os.environ.get("REPLICATE_POLL_INTERVAL", 2.0))
 POLL_TIMEOUT = int(os.environ.get("REPLICATE_POLL_TIMEOUT", 300))
 
 def replicate_generate_video(prompt, timeout_seconds=POLL_TIMEOUT, **kwargs):
     """
-    Create a video using Replicate predictions API
-    Returns saved video file path OR None on failure
+    Create a video using Replicate predictions API and return
+    absolute saved path (mp4) or None on failure.
     """
-
     if not REPLICATE_API_TOKEN:
         app.logger.error("No REPLICATE_API_TOKEN found")
         return None
 
-    # final model reference (no :version needed)
-    model_ref = REPLICATE_MODEL_VERSION
+    # build model reference (model or model:version)
+    model_ref = REPLICATE_MODEL_VERSION or kwargs.get("model")
     if not model_ref:
         app.logger.error("REPLICATE_MODEL_VERSION not configured")
         return None
 
     try:
-        # Init client
+        # init client
         client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-        # Input payload
-        payload = {
-            "prompt": prompt,
-        }
+        # build input payload (prompt + any overrides)
+        payload = {"prompt": prompt}
         payload.update(kwargs.get("input", {}))
 
         app.logger.info(f"Creating Replicate job for: {model_ref}")
-
-        # Create prediction job
         prediction = client.predictions.create(
             model=model_ref,
             input=payload
         )
 
         start = time.time()
-
-        # Poll status
+        # poll status
         while True:
             prediction = client.predictions.get(prediction.id)
             status = prediction.status
-
+            app.logger.debug(f"Replicate status={status}")
             if status == "succeeded":
                 break
             if status in ("failed", "canceled"):
@@ -113,36 +108,35 @@ def replicate_generate_video(prompt, timeout_seconds=POLL_TIMEOUT, **kwargs):
             if time.time() - start > timeout_seconds:
                 app.logger.error("Replicate job timeout")
                 return None
-
             time.sleep(POLL_INTERVAL)
 
-        # Get output
+        # get output
         output = getattr(prediction, "output", None)
         if not output:
             app.logger.error("No output from Replicate")
             return None
 
-        # First item if list
-        out_item = output[0] if isinstance(output, (list,tuple)) else output
+        # take first item if list
+        out_item = output[0] if isinstance(output, (list, tuple)) else output
 
-        # extract URL
+        # extract url
         if isinstance(out_item, dict):
             url = out_item.get("url") or out_item.get("uri")
         else:
             url = str(out_item)
 
         if not url:
-            app.logger.error("No downloadable URL")
+            app.logger.error("No downloadable URL from Replicate output")
             return None
 
-        # Download video
+        # download video
         dl = requests.get(url, stream=True, timeout=30)
         dl.raise_for_status()
 
+        # detect extension from headers or fallback to .mp4
         ext = ".mp4"
-        ctype = dl.headers.get("content-type","")
-
-        if "audio" in ctype:
+        ctype = dl.headers.get("content-type", "")
+        if "audio" in ctype and "mp3" in ctype:
             ext = ".mp3"
         elif "video" in ctype:
             if "quicktime" in ctype:
@@ -159,6 +153,7 @@ def replicate_generate_video(prompt, timeout_seconds=POLL_TIMEOUT, **kwargs):
                 if chunk:
                     f.write(chunk)
 
+        app.logger.info(f"Saved replicate output to {save_path}")
         return save_path
 
     except Exception as e:
