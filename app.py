@@ -1,298 +1,308 @@
-#!/usr/bin/env python3
 """
-app.py - VISORA backend entrypoint
-Features:
-- /generate-video        (sync)  : Accepts "script" -> runs Scene Engine -> runs 3D generator -> uploads to S3 -> returns video metadata
-- /generate-video-async  (async) : Enqueue job to Redis (RQ) if available; returns job id
-- /job-status/<job_id>   : Check async job status
-- /download/<video_id>   : Download stored file (mostly for local testing)
-- Health endpoint /
-Notes:
-- Requires engine.cinematic_engine and engine.generator_3d to be present.
-- Requires AWS credentials set in environment for S3 upload.
+app.py
+Main Flask app that exposes /create-video and job status endpoints.
+Designed to use your local engine modules (generator_3d, template_engine,
+voiceclone, lipsync, mixer, postprocess, etc.) to produce a final MP4.
+
+How it works (flow):
+1. Client POST /create-video with JSON { "script": "...", "preset": "...", "callback_url": "... (optional)" }
+2. Server creates a unique job id, writes a job folder.
+3. Server calls engine functions in sequence:
+   - template_engine.parse_script -> scene_spec
+   - generator_3d.render_scene(scene_spec, out_dir) -> raw_frames/scene_video
+   - voiceclone/synthesize_audio -> audio_file
+   - lipsync.generate_lipsync -> visemes/timing
+   - mixer.combine(video, audio) -> merged.mp4
+   - postprocess.optimize -> final.mp4
+4. Server returns JSON { job_id, status_url } immediately (async) or can run sync if requested.
+5. Client can GET /job/<job_id> to check status and download.
+
+IMPORTANT:
+- Replace module imports with your exact module paths if different.
+- This implementation uses a simple disk-based job queue and background ThreadPoolExecutor.
+- For production you may switch to Redis/RQ or Celery (requirements already have redis/rq).
 """
 
 import os
 import uuid
 import json
-import logging
+import shutil
 import traceback
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file, abort
-from werkzeug.utils import secure_filename
 
-# Scene engine and 3D generator (must exist)
-from engine.cinematic_engine import CinematicSceneEngine
+# ---------- CONFIG ----------
+BASE_DIR = Path(__file__).resolve().parent
+JOBS_DIR = BASE_DIR / "jobs"
+OUTPUT_DIR = BASE_DIR / "public" / "videos"
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))  # parallel renderers
+ALLOWED_PRESETS = ["reel", "short", "cinematic", "fullhd", "ultrahd"]
 
-# generator_3d should expose generate_scene_video(scenes, output_path, options={})
-# implement the heavy GPU inference inside that module to keep app.py clean.
+# make dirs
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------- IMPORT YOUR ENGINES ----------
+# Replace these imports with your actual module paths if different.
+# Example: from engine.generator_3d import render_scene
+# Example: from engine.template_engine import parse_script
 try:
-    from engine.generator_3d import generate_scene_video
-    GENERATOR_AVAILABLE = True
+    from generator_3d import render_scene           # expected function: render_scene(scene_spec, out_dir, params) -> dict(status, files)
 except Exception:
-    # generator_3d may not be ready locally; keep flag to handle gracefully
-    GENERATOR_AVAILABLE = False
+    # fallback import path
+    try:
+        from engine.generator_3d import render_scene
+    except Exception:
+        render_scene = None
 
-# Optional: Redis RQ for async jobs (if installed and configured)
-USE_RQ = False
 try:
-    import redis
-    from rq import Queue, get_current_job
-    USE_RQ = True
+    from template_engine import parse_script        # expected function: parse_script(script_text, preset) -> scene_spec (dict)
 except Exception:
-    USE_RQ = False
+    try:
+        from engine.template_engine import parse_script
+    except Exception:
+        parse_script = None
 
-# S3 client
-import boto3
-from botocore.exceptions import ClientError
+# Optional components (voice, lipsync, mixer, postprocess)
+try:
+    from voiceclone import synthesize_voice         # synthesize_voice(text, voice_params, out_path) -> filepath
+except Exception:
+    synthesize_voice = None
 
-# Config from env (assume user already set these in Render/AWS)
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-S3_BUCKET = os.getenv("S3_BUCKET", "")
-S3_KEY_PREFIX = os.getenv("S3_KEY_PREFIX", "videos/")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
-WORK_DIR = os.getenv("WORK_DIR", "/tmp/visora_work")
+try:
+    from lipsync import apply_lipsync               # apply_lipsync(audio_path, scene_spec, out_dir) -> updates scene frames or timing
+except Exception:
+    apply_lipsync = None
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(WORK_DIR, exist_ok=True)
+try:
+    from mixer import combine_audio_video           # combine_audio_video(video_path, audio_path, out_path) -> filepath
+except Exception:
+    combine_audio_video = None
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("visora-app")
+try:
+    from postprocess import optimize_video         # optimize_video(in_path, out_path, params) -> filepath
+except Exception:
+    optimize_video = None
 
-# Initialize Flask
+# ---------- APP ----------
 app = Flask(__name__)
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-# Initialize engines
-scene_engine = CinematicSceneEngine()
+# job store (simple JSON per job)
+def job_file(job_id):
+    return JOBS_DIR / f"{job_id}.json"
 
-# Init S3 client (uses env AWS_ACCESS_KEY_ID & AWS_SECRET_ACCESS_KEY)
-s3_client = boto3.client("s3", region_name=AWS_REGION)
+def save_job_meta(job_id, data):
+    with open(job_file(job_id), "w") as f:
+        json.dump(data, f, indent=2, default=str)
 
-# RQ queue if available and REDIS_URL env present
-rq_queue = None
-if USE_RQ:
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-    try:
-        redis_conn = redis.from_url(REDIS_URL)
-        rq_queue = Queue("visora_video_queue", connection=redis_conn)
-        logger.info("RQ queue configured.")
-    except Exception as e:
-        logger.warning("RQ configured but connection failed: %s", str(e))
-        rq_queue = None
+def load_job_meta(job_id):
+    p = job_file(job_id)
+    if not p.exists():
+        return None
+    return json.load(open(p, "r"))
 
-# Helper utilities
-def make_video_id():
-    return uuid.uuid4().hex
+# helper to mark job status
+def update_job_status(job_id, status, extra=None):
+    meta = load_job_meta(job_id) or {}
+    meta["status"] = status
+    meta["updated_at"] = datetime.utcnow().isoformat()
+    if extra:
+        meta.setdefault("history", []).append({"ts": datetime.utcnow().isoformat(), "note": extra})
+    save_job_meta(job_id, meta)
 
-def local_video_path(video_id):
-    # safe filename
-    filename = secure_filename(f"{video_id}.mp4")
-    return os.path.join(OUTPUT_DIR, filename)
-
-def s3_key_for(video_id):
-    # ensure prefix ends with /
-    prefix = S3_KEY_PREFIX or ""
-    if prefix and not prefix.endswith("/"):
-        prefix = prefix + "/"
-    return f"{prefix}{video_id}.mp4"
-
-def upload_to_s3(local_path, key):
-    try:
-        s3_client.upload_file(local_path, S3_BUCKET, key)
-        s3_url = f"s3://{S3_BUCKET}/{key}"
-        # also return https URL (public access depends on bucket policy; we assume presigned used)
-        presigned = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=3600)
-        return {"s3_url": s3_url, "presigned_url": presigned}
-    except ClientError as e:
-        logger.error("S3 upload failed: %s", str(e))
-        raise
-
-def safe_write_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def run_generation_pipeline(script_text, video_id=None, options=None):
+# ---------- VIDEO PIPELINE (worker) ----------
+def worker_render(job_id):
     """
-    Runs the full pipeline synchronously:
-    - scene extraction
-    - call 3D generator (local/AWS GPU)
-    - upload file to S3
-    Returns metadata dict
+    Background worker that performs the rendering pipeline for a job.
+    It updates the job metadata file along the way.
     """
-    options = options or {}
-    video_id = video_id or make_video_id()
-    vid_path = local_video_path(video_id)
-    meta = {
-        "video_id": video_id,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "script": script_text,
-        "status": "started",
-        "scenes": None,
-        "local_path": vid_path,
-        "s3": None,
-        "error": None,
-    }
+    meta = load_job_meta(job_id)
+    if meta is None:
+        return
 
-    logger.info("Starting pipeline for video_id=%s", video_id)
     try:
-        # 1) Scene engine
-        scenes = scene_engine.extract(script_text)
-        meta["scenes"] = scenes
-        logger.info("Scenes generated for %s: %s", video_id, scenes)
+        update_job_status(job_id, "started", "Worker picked job")
+        job_dir = JOBS_DIR / job_id
+        job_dir.mkdir(exist_ok=True)
+        script = meta.get("script")
+        preset = meta.get("preset", "cinematic")
 
-        # Save scenes json for debugging
-        scenes_path = os.path.join(WORK_DIR, f"{video_id}_scenes.json")
-        safe_write_json(scenes_path, scenes)
+        # 1) parse script -> scene_spec
+        update_job_status(job_id, "parsing", "Parsing script to scene spec")
+        if parse_script is None:
+            raise RuntimeError("parse_script() module not found. Check imports.")
+        scene_spec = parse_script(script, preset=preset)
+        # save spec
+        with open(job_dir / "scene_spec.json", "w") as f:
+            json.dump(scene_spec, f, indent=2, default=str)
 
-        # 2) 3D generator (heavy lifting) - MUST be implemented in engine.generator_3d
-        if not GENERATOR_AVAILABLE:
-            raise RuntimeError("3D generator module not available. Implement engine.generator_3d.generate_scene_video.")
-
-        # generator should write final mp4 at vid_path
-        generate_scene_video(scenes, vid_path, options=options)
-        if not os.path.exists(vid_path) or os.path.getsize(vid_path) == 0:
-            raise RuntimeError(f"Generator produced no output (empty file) at {vid_path}")
-
-        meta["status"] = "generated"
-        logger.info("Video generated locally at %s", vid_path)
-
-        # 3) Upload to S3 (optional, if S3 configured)
-        if S3_BUCKET:
-            key = s3_key_for(video_id)
-            s3_info = upload_to_s3(vid_path, key)
-            meta["s3"] = s3_info
-            meta["status"] = "uploaded"
-            logger.info("Uploaded %s to S3 as %s", vid_path, key)
+        # 2) generate 3D/video frames or primary video asset
+        update_job_status(job_id, "rendering", "Rendering scene to frames/video (generator_3d)")
+        if render_scene is None:
+            raise RuntimeError("render_scene() module not found. Check imports.")
+        render_params = meta.get("render_params", {})
+        render_out = job_dir / "render_out"
+        render_out.mkdir(exist_ok=True)
+        # expect render_scene returns dict with keys: 'status' and 'video' or 'frames'
+        result = render_scene(scene_spec, str(render_out), render_params)
+        if not isinstance(result, dict):
+            raise RuntimeError("render_scene() must return a dict with output paths.")
+        # find primary video file
+        primary_video = result.get("video") or result.get("output")
+        if primary_video:
+            primary_video = Path(primary_video)
         else:
-            logger.info("S3_BUCKET not configured; skipping upload.")
+            # maybe render produced frames; user should provide frame->video step inside render_scene
+            # fallback: look for any mp4 inside render_out
+            mp4s = list(render_out.glob("*.mp4"))
+            primary_video = mp4s[0] if mp4s else None
 
-        # save metadata
-        meta_path = os.path.join(WORK_DIR, f"{video_id}_meta.json")
-        safe_write_json(meta_path, meta)
-        return meta
+        if primary_video is None or not primary_video.exists():
+            raise RuntimeError("Primary rendered video not found in render output.")
+
+        update_job_status(job_id, "render_done", f"Primary render produced {primary_video.name}")
+
+        # 3) generate voice (optional)
+        audio_file = None
+        if synthesize_voice is not None:
+            update_job_status(job_id, "synthesizing_audio", "Generating voice audio")
+            voice_params = meta.get("voice", {})
+            audio_path = job_dir / "voice.wav"
+            audio_file = synthesize_voice(script, voice_params, str(audio_path))
+            update_job_status(job_id, "audio_ready", f"Audio produced {audio_file}")
+
+        # 4) lipsync (optional) - align mouth animation
+        if apply_lipsync is not None and audio_file:
+            update_job_status(job_id, "lipsync", "Applying lipsync")
+            apply_lipsync(str(audio_file), scene_spec, str(render_out))
+            update_job_status(job_id, "lipsync_done", "Lipsync applied")
+
+        # 5) combine audio + video
+        final_raw = job_dir / "merged_raw.mp4"
+        if audio_file and combine_audio_video is not None:
+            update_job_status(job_id, "combining", "Combining audio & video")
+            merged_path = combine_audio_video(str(primary_video), str(audio_file), str(final_raw))
+            final_video_path = Path(merged_path)
+        else:
+            # no audio or no mixer -> use primary_video as final_raw
+            final_video_path = primary_video
+
+        update_job_status(job_id, "combined", f"Combined video at {final_video_path.name}")
+
+        # 6) postprocess / optimize
+        final_pub = OUTPUT_DIR / f"{job_id}.mp4"
+        if optimize_video is not None:
+            update_job_status(job_id, "postprocessing", "Optimizing final video")
+            optimize_video(str(final_video_path), str(final_pub), params=meta.get("postprocess", {}))
+        else:
+            # simple copy if no postprocess
+            shutil.copyfile(str(final_video_path), str(final_pub))
+
+        update_job_status(job_id, "done", f"Final video ready at {final_pub}")
+        # store result
+        meta = load_job_meta(job_id) or {}
+        meta["result"] = {"video_url": f"/download/{job_id}"}
+        save_job_meta(job_id, meta)
+
+        # optional: callback
+        callback = meta.get("callback_url")
+        if callback:
+            try:
+                import requests
+                requests.post(callback, json={"job_id": job_id, "status": "done", "video_url": meta["result"]["video_url"]}, timeout=5)
+            except Exception:
+                pass
 
     except Exception as e:
-        logger.error("Pipeline failed for %s: %s", video_id, str(e))
-        logger.debug(traceback.format_exc())
-        meta["status"] = "error"
+        tb = traceback.format_exc()
+        update_job_status(job_id, "failed", f"{str(e)}")
+        meta = load_job_meta(job_id) or {}
         meta["error"] = str(e)
-        # attempt to persist error metadata
-        try:
-            meta_path = os.path.join(WORK_DIR, f"{video_id}_meta.json")
-            safe_write_json(meta_path, meta)
-        except Exception:
-            pass
-        return meta
+        meta["traceback"] = tb
+        save_job_meta(job_id, meta)
+        return
 
-# If RQ available, create an RQ job function wrapper
-if USE_RQ and rq_queue:
-    def rq_job_generate(script_text, options=None):
-        job = get_current_job()
-        vid = make_video_id()
-        # Update job meta
-        job.meta.update({"video_id": vid, "status": "queued", "script_preview": script_text[:120]})
-        job.save_meta()
-        # Run pipeline
-        result = run_generation_pipeline(script_text, video_id=vid, options=options)
-        job.meta.update({"status": result.get("status"), "s3": result.get("s3")})
-        job.save_meta()
-        return result
-
-# Routes
-
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"status": "VISORA_ENGINE_ACTIVE", "generator_available": GENERATOR_AVAILABLE, "rq_enabled": bool(rq_queue)})
-
-@app.route("/generate-video", methods=["POST"])
-def generate_video_endpoint():
+# ---------- ROUTES ----------
+@app.route("/create-video", methods=["POST"])
+def create_video():
     """
-    Synchronous generation endpoint (blocking).
-    JSON body: {"script": "...", "options": {...}}
-    Response: metadata JSON
+    POST JSON:
+    {
+      "script": "A boy walking in rain, cinematic look",
+      "preset": "cinematic",
+      "async": true,            # if true returns job id immediately; if false server will try to run synchronously
+      "callback_url": "https://...",   # optional: we will POST job done to this URL
+      "render_params": { ... }  # optional params forwarded to generator
+    }
     """
-    try:
-        data = request.get_json(force=True)
-        script = data.get("script", "")
-        options = data.get("options", {})
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"ok": False, "error": "Invalid or missing JSON body"}), 400
 
-        if not script or len(script.strip()) < 2:
-            return jsonify({"error": "script missing or too short"}), 400
+    script = data.get("script") or data.get("inputs") or data.get("prompt")
+    if not script:
+        return jsonify({"ok": False, "error": "Missing 'script' / 'prompt' field"}), 400
 
-        # Generate unique video id
-        video_id = make_video_id()
+    preset = data.get("preset", "cinematic")
+    if preset not in ALLOWED_PRESETS:
+        preset = "cinematic"
 
-        # Run pipeline (blocking) - this will call generator_3d
-        meta = run_generation_pipeline(script, video_id=video_id, options=options)
-        status_code = 200 if meta.get("status") in ("uploaded", "generated") else 500
-        return jsonify(meta), status_code
+    job_id = uuid.uuid4().hex[:16]
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
 
-    except Exception as e:
-        logger.error("generate-video endpoint error: %s", str(e))
-        return jsonify({"error": str(e)}), 500
+    meta = {
+        "job_id": job_id,
+        "created_at": datetime.utcnow().isoformat(),
+        "status": "queued",
+        "script": script,
+        "preset": preset,
+        "render_params": data.get("render_params", {}),
+        "callback_url": data.get("callback_url"),
+    }
+    save_job_meta(job_id, meta)
 
-@app.route("/generate-video-async", methods=["POST"])
-def generate_video_async():
-    """
-    Enqueue job to Redis RQ if available.
-    Returns job id immediately.
-    """
-    if not rq_queue:
-        return jsonify({"error": "Async queue not configured (REDIS_URL missing or rq not installed)"}), 400
-
-    try:
-        data = request.get_json(force=True)
-        script = data.get("script", "")
-        options = data.get("options", {})
-
-        if not script or len(script.strip()) < 2:
-            return jsonify({"error": "script missing or too short"}), 400
-
-        # enqueue job
-        job = rq_queue.enqueue(rq_job_generate, script, options)
-        return jsonify({"ok": True, "job_id": job.get_id(), "enqueue_time": str(datetime.utcnow())}), 200
-    except Exception as e:
-        logger.error("generate-video-async error: %s", str(e))
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/job-status/<job_id>", methods=["GET"])
-def job_status(job_id):
-    if not rq_queue:
-        return jsonify({"error": "Async queue not configured"}), 400
-    try:
-        from rq.job import Job
-        job = Job.fetch(job_id, connection=rq_queue.connection)
-        meta = {
-            "id": job.get_id(),
-            "status": job.get_status(),
-            "result": job.result,
-            "meta": job.meta
-        }
-        return jsonify(meta), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/download/<video_id>", methods=["GET"])
-def download_video(video_id):
-    # local file
-    path = local_video_path(video_id)
-    if os.path.exists(path):
-        return send_file(path, as_attachment=True, download_name=f"{video_id}.mp4")
+    # run in background or synchronous
+    run_async = data.get("async", True)
+    if run_async:
+        executor.submit(worker_render, job_id)
+        return jsonify({"ok": True, "job_id": job_id, "status_url": f"/job/{job_id}"}), 202
     else:
-        return jsonify({"error": "file not found"}), 404
+        # run sync (blocking) - not recommended for long renders
+        worker_render(job_id)
+        meta = load_job_meta(job_id)
+        if meta.get("status") == "done":
+            return jsonify({"ok": True, "job_id": job_id, "video_url": meta["result"]["video_url"]}), 200
+        else:
+            return jsonify({"ok": False, "job_id": job_id, "status": meta.get("status"), "error": meta.get("error")}), 500
 
-# simple endpoint to list outputs (for debugging only)
-@app.route("/list-outputs", methods=["GET"])
-def list_outputs():
-    files = []
-    for f in os.listdir(OUTPUT_DIR):
-        if f.endswith(".mp4"):
-            full = os.path.join(OUTPUT_DIR, f)
-            files.append({"file": f, "size": os.path.getsize(full)})
-    return jsonify({"outputs": files})
+@app.route("/job/<job_id>", methods=["GET"])
+def job_status(job_id):
+    meta = load_job_meta(job_id)
+    if not meta:
+        return jsonify({"ok": False, "error": "job not found"}), 404
+    # if finished, provide download link
+    if meta.get("status") == "done" and meta.get("result"):
+        return jsonify({"ok": True, "job": meta}), 200
+    return jsonify({"ok": True, "job": meta}), 200
 
-# Run
+@app.route("/download/<job_id>", methods=["GET"])
+def download_video(job_id):
+    final = OUTPUT_DIR / f"{job_id}.mp4"
+    if not final.exists():
+        return jsonify({"ok": False, "error": "file not ready"}), 404
+    # send file
+    return send_file(str(final), mimetype="video/mp4", as_attachment=True, attachment_filename=f"{job_id}.mp4")
+
+# health
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "status": "alive", "workers": MAX_WORKERS})
+
+# ---------- MAIN ----------
 if __name__ == "__main__":
-    # production: run with gunicorn in Render/EC2, this is fallback dev server
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    # for local dev only
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=False)
