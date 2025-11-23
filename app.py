@@ -215,26 +215,80 @@ for i in range(max(1, WORKER_THREADS)):
     t.start()
 
 # ---------- Routes ----------
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": True, "hf_token_present": bool(HF_TOKEN)})
-
-@app.route("/model-check", methods=["POST"])
-def model_check():
-    data = request.get_json(silent=True) or request.form.to_dict() or {}
-    model = (data.get("model") or HF_MODEL_DEFAULT).strip()
-    if not HF_TOKEN:
-        return jsonify({"status": False, "error": "HF_TOKEN not configured"}), 400
-    url = f"https://api-inference.huggingface.co/models/{model}"
-    try:
-        r = requests.head(url, headers={"Authorization": f"Bearer {HF_TOKEN}"}, timeout=15)
-    except Exception as e:
-        return jsonify({"status": False, "error": f"Request failed: {e}"}), 500
-    if r.status_code == 200:
-        return jsonify({"status": True, "model": model})
+@app.route("/create-video", methods=["POST"])
+def create_video():
+    # accept json or form-data
+    if request.is_json:
+        data = request.get_json() or {}
     else:
-        j = safe_json(r)
-        return jsonify({"status": False, "http_status": r.status_code, "detail": j}), 400
+        data = request.form.to_dict() or {}
+
+    prompt = data.get("script") or data.get("prompt")
+    if not prompt:
+        return jsonify({"status": False, "error": "No script/prompt provided"})
+
+    model = HF_MODEL_DEFAULT
+    if not HF_TOKEN:
+        return jsonify({"status": False, "error": "HF_TOKEN missing"})
+
+    # HuggingFace API call
+    import requests, uuid, os, json
+
+    HF_API_URL = f"https://router.huggingface.co/models/{model}"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {"inputs": prompt}
+
+    try:
+        r = requests.post(HF_API_URL, headers=headers, json=payload, timeout=300)
+    except Exception as e:
+        return jsonify({"status": False, "error": str(e)})
+
+    if r.status_code >= 300:
+        return jsonify({
+            "status": False,
+            "error": f"HF error {r.status_code}",
+            "detail": r.text
+        })
+
+    resp = r.json()
+
+    # Try multiple keys
+    video_url = (
+        resp.get("generated_video")
+        or resp.get("video")
+        or resp.get("output")
+        or None
+    )
+
+    if not video_url:
+        return jsonify({
+            "status": False,
+            "error": "No video URL returned",
+            "raw_response": resp
+        })
+
+    # Save video locally
+    try:
+        fname = f"hf_{uuid.uuid4().hex[:8]}.mp4"
+        save_path = os.path.join(VIDEO_SAVE_DIR, fname)
+
+        vr = requests.get(video_url, stream=True, timeout=200)
+        with open(save_path, "wb") as f:
+            for chunk in vr.iter_content(8192):
+                if chunk:
+                    f.write(chunk)
+
+        return jsonify({
+            "status": True,
+            "video_file": save_path,
+            "video_url": video_url
+        })
+    except Exception as e:
+        return jsonify({"status": False, "error": "Failed to save video", "detail": str(e)})
 
 @app.route("/predict", methods=["POST"])
 def predict():
