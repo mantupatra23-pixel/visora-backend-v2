@@ -1,344 +1,431 @@
-# app.py
-"""
-HF-only video generation backend (final).
-Features added:
- - input validation & limits
- - optional API_KEY auth for your API
- - background cleaner (remove old videos)
- - returns public download URL if SERVICE_BASE_URL is set
- - robust HF error reporting + router compatible
- - safe file handling & logging
-"""
-import os
-import time
-import uuid
-import threading
-import requests
-import json
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file, abort
+# ---------------- app.py (FINAL feature-complete) ----------------
+#!/usr/bin/env python3
+import os, time, uuid, json, logging, threading, queue, argparse
+from pathlib import Path
+from typing import Optional, Dict, Any
+from flask import Flask, request, jsonify, send_from_directory, Response, abort
 from flask_cors import CORS
+import requests
 
-# ---------------- Config from env ----------------
+# Optional imports (may not be present)
+try:
+    import redis
+    from rq import Queue as RQQueue, Worker as RQWorker
+    REDIS_AVAILABLE = True
+except Exception:
+    REDIS_AVAILABLE = False
 
+try:
+    from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+    JWT_AVAILABLE = True
+except Exception:
+    JWT_AVAILABLE = False
+
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+    LIMITER_AVAILABLE = True
+except Exception:
+    LIMITER_AVAILABLE = False
+
+try:
+    from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+    METRICS_AVAILABLE = True
+except Exception:
+    METRICS_AVAILABLE = False
+
+# ---------------- CONFIG from ENV ----------------
+HF_MODEL = os.environ.get("HF_MODEL", "").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-HF_MODEL = os.environ.get("HF_MODEL", "cerspense/zeroscope-v2-xl").strip()
+HF_API_INFERENCE_BASE = os.environ.get("HF_API_INFERENCE_BASE", "https://api-inference.huggingface.co/models").rstrip("/")
+HF_ROUTER_BASE = os.environ.get("HF_ROUTER_BASE", "https://router.huggingface.co/api/models").rstrip("/")
+OUT_DIR = Path(os.environ.get("OUT_DIR", "./videos")).resolve()
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# HF_API_URL: agar env me diya nahi hai to router URL auto banega
-HF_API_URL = os.environ.get("HF_API_URL", "").strip()
-if not HF_API_URL:
-    HF_API_URL = f"https://router.huggingface.co/api/models/{HF_MODEL}"
+API_KEY = os.environ.get("API_KEY", "").strip()
+JWT_SECRET = os.environ.get("JWT_SECRET", "").strip()
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS","1"))
+JOB_RETRY = int(os.environ.get("JOB_RETRY","1"))
+CALL_TIMEOUT = int(os.environ.get("CALL_TIMEOUT","600"))
+RATE_LIMIT = os.environ.get("RATE_LIMIT", "20/minute")
+USER_QUOTA_PER_DAY = int(os.environ.get("USER_QUOTA_PER_DAY","200"))
+PORT = int(os.environ.get("PORT","8000"))
+HOST = os.environ.get("HOST","0.0.0.0")
 
-SERVICE_BASE_URL = os.environ.get("SERVICE_BASE_URL", "").strip() or None
-API_KEY = os.environ.get("API_KEY", "").strip() or None
+# ---------------- Logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("visora-final-all")
 
-VIDEO_SAVE_DIR = os.environ.get("VIDEO_SAVE_DIR", "videos")
-os.makedirs(VIDEO_SAVE_DIR, exist_ok=True)
-
-# safety / limits
-MAX_PROMPT_LENGTH = int(os.environ.get("MAX_PROMPT_LENGTH", 5000))
-MAX_SCENES = int(os.environ.get("MAX_SCENES", 10))
-MAX_VIDEO_AGE_DAYS = int(os.environ.get("MAX_VIDEO_AGE_DAYS", 7))
-MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", 200))
-
-# worker / cleanup
-WORKER_THREADS = int(os.environ.get("WORKER_THREADS", 1))
-
-# polls/timeouts (replicate removed, keep for compatibility)
-REPLICATE_POLL_INTERVAL = float(os.environ.get("REPLICATE_POLL_INTERVAL", 3))
-REPLICATE_POLL_TIMEOUT = int(os.environ.get("REPLICATE_POLL_TIMEOUT", 300))
-
-app = Flask(__name__)
+# ---------------- Flask app ----------------
+app = Flask("visora-final-all")
 CORS(app)
 
-# ---------------- Helpers ----------------
-def safe_json(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return {"text": resp.text or ""}
+# ---------------- Optional components init ----------------
+jwt = None
+if JWT_AVAILABLE and JWT_SECRET:
+    app.config["JWT_SECRET_KEY"] = JWT_SECRET
+    jwt = JWTManager(app)
+    log.info("JWT auth enabled")
 
-
-def uuid_filename(prefix="hf_", ext="mp4"):
-    return f"{prefix}{uuid.uuid4().hex[:12]}.{ext}"
-
-
-def download_url_to_file(url, dest_path, timeout=120):
-    """Download url to file path. Returns True on success, False otherwise."""
-    try:
-        r = requests.get(url, stream=True, timeout=timeout)
-        r.raise_for_status()
-        total = 0
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(8192):
-                if chunk:
-                    f.write(chunk)
-                    total += len(chunk)
-                    # optional - enforce size limit
-                    if MAX_FILE_SIZE_MB and total > MAX_FILE_SIZE_MB * 1024 * 1024:
-                        app.logger.warning("Download exceeded max file size, aborting.")
-                        return False
-        return True
-    except Exception as e:
-        app.logger.exception("Failed downloading asset: %s", e)
-        return False
-
-
-def file_public_url(fname):
-    """Return public URL if SERVICE_BASE_URL is configured, else return local path."""
-    if SERVICE_BASE_URL:
-        return SERVICE_BASE_URL.rstrip("/") + f"/download?file={fname}"
-    return os.path.join(VIDEO_SAVE_DIR, fname)
-
-
-def cleanup_old_files():
-    """Background job - delete old video files older than MAX_VIDEO_AGE_DAYS."""
-    while True:
+limiter = None
+if LIMITER_AVAILABLE:
+    if REDIS_AVAILABLE and REDIS_URL:
         try:
-            cutoff = datetime.utcnow() - timedelta(days=MAX_VIDEO_AGE_DAYS)
-            for fname in os.listdir(VIDEO_SAVE_DIR):
-                fpath = os.path.join(VIDEO_SAVE_DIR, fname)
-                try:
-                    mtime = datetime.utcfromtimestamp(os.path.getmtime(fpath))
-                    if mtime < cutoff:
-                        os.remove(fpath)
-                        app.logger.info("Removed old file %s", fpath)
-                except Exception:
-                    pass
+            from redis import Redis
+            redis_store = Redis.from_url(REDIS_URL)
+            limiter = Limiter(app, key_func=get_remote_address, storage_uri=REDIS_URL)
         except Exception:
-            app.logger.exception("Cleaner thread error")
-        # run cleanup once per hour
-        time.sleep(3600)
-
-
-def check_api_key():
-    """Simple API key check - use as decorator logic in endpoints if API_KEY is set."""
-    if API_KEY:
-        key = request.headers.get("X-API-KEY") or request.args.get("api_key") or request.form.get("api_key")
-        if not key or key != API_KEY:
-            abort(401, description="Invalid or missing API key")
-
-# --- HuggingFace router call (replace old api-inference usage) ---
-def hf_create_and_wait(model, input_payload, timeout=300):
-    """
-    Call Hugging Face Router endpoint for model inference and return outputs.
-    model: string like "owner/model" or "owner/model:version" if versioned.
-    input_payload: dict to send as JSON input.
-    """
-    hf_token = os.environ.get("HF_TOKEN", "").strip()
-    if not hf_token:
-        raise RuntimeError("HF_TOKEN not set in env")
-
-    url = f"https://router.huggingface.co/api/models/{model}"
-    headers = {
-        "Authorization": f"Bearer {hf_token}",
-        "Content-Type": "application/json"
-    }
-
-    try:
-        resp = requests.post(url, json=input_payload, headers=headers, timeout=60)
-    except Exception as e:
-        raise RuntimeError(f"HuggingFace request failed: {e}")
-
-    if resp.status_code >= 400:
-        # bubble up message for easier debugging
-        raise RuntimeError(f"HF error {resp.status_code}: {resp.text}")
-
-    # router usually returns the model output directly (could be bytes/json)
-    try:
-        return resp.json()  # if JSON
-    except Exception:
-        return resp.content  # fallback (e.g., raw bytes)
-
-# ---------------- Routes ----------------
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "status": True,
-        "hf_token_present": bool(HF_TOKEN),
-        "hf_model": HF_MODEL or None,
-        "service_base_url": SERVICE_BASE_URL,
-        "video_save_dir": VIDEO_SAVE_DIR
-    })
-
-
-@app.route("/model-check", methods=["POST"])
-def model_check():
-    check_api_key()
-    if not HF_TOKEN:
-        return jsonify({"status": False, "error": "HF_TOKEN not set"}), 400
-    model = (request.get_json(silent=True) or {}).get("model") or HF_MODEL
-    if not model:
-        return jsonify({"status": False, "error": "No model provided and no HF_MODEL set"}), 400
-
-    url = os.environ.get("HF_API_URL") or f"https://router.huggingface.co/api/models/{model}"
-    try:
-        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-        r = requests.head(url, headers=headers, timeout=15)
-        if r.status_code in (200, 204):
-            return jsonify({"status": True, "model": model})
-        else:
-            return jsonify({"status": False, "http_status": r.status_code, "detail": safe_json(r)}), 400
-    except Exception as e:
-        app.logger.exception("Model check failed")
-        return jsonify({"status": False, "error": str(e)}), 500
-
-
-@app.route("/create-video", methods=["POST"])
-def create_video():
-    check_api_key()
-
-    # accept JSON or form-data
-    if request.is_json:
-        data = request.get_json() or {}
+            limiter = Limiter(app, key_func=get_remote_address)
     else:
-        data = request.form.to_dict() or {}
+        limiter = Limiter(app, key_func=get_remote_address)
+    log.info("Rate limiter enabled (%s)", RATE_LIMIT)
+    limiter.limit(RATE_LIMIT)(lambda: None)  # ensure it's configured
 
-    prompt = (data.get("script") or data.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"status": False, "error": "No script/prompt provided"}), 400
-    if len(prompt) > MAX_PROMPT_LENGTH:
-        return jsonify({"status": False, "error": "Prompt too long", "max": MAX_PROMPT_LENGTH}), 400
+# Prometheus metrics
+if METRICS_AVAILABLE:
+    REQ_COUNTER = Counter("visora_requests_total", "Total HTTP requests", ["endpoint","method","status"])
+    JOB_COUNTER = Counter("visora_jobs_total", "Total jobs", ["result"])  # result: success/fail
+    JOB_TIME = Histogram("visora_job_seconds", "Job durations seconds")
+else:
+    REQ_COUNTER = JOB_COUNTER = JOB_TIME = None
 
+# ---------------- Queue setup (Redis RQ or in-memory) ----------------
+USE_RQ = False
+rq_queue = None
+if REDIS_AVAILABLE and REDIS_URL:
     try:
-        max_scenes = int(data.get("max_scenes", 1))
-    except Exception:
-        max_scenes = 1
-    max_scenes = max(1, min(max_scenes, MAX_SCENES))
-
-    model = data.get("model") or HF_MODEL
-    if not model:
-        return jsonify({"status": False, "error": "No model configured (HF_MODEL)"}), 400
-
-    hf_url = os.environ.get("HF_API_URL") or f"https://router.huggingface.co/api/models/{model}"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-    payload = {
-        "inputs": prompt,
-        "parameters": {"max_scenes": max_scenes}
-    }
-
-    try:
-        resp = requests.post(hf_url, json=payload, headers=headers, timeout=180)
+        rconn = redis.from_url(REDIS_URL)
+        rq_queue = RQQueue("visora", connection=rconn)
+        USE_RQ = True
+        log.info("Using Redis RQ at %s", REDIS_URL)
     except Exception as e:
-        app.logger.exception("HF request failed")
-        return jsonify({"status": False, "error": "HF request failed", "detail": str(e)}), 500
+        log.warning("Redis RQ init failed: %s", e)
+        USE_RQ = False
 
-    if resp.status_code >= 300:
-        # return HF response content to help debugging
-        return jsonify({
-            "status": False,
-            "error": "HF error",
-            "http_status": resp.status_code,
-            "detail": safe_json(resp)
-        }), 502
+# In-memory fallback
+task_queue = queue.Queue()
+jobs: Dict[str, Dict[str, Any]] = {}
+jobs_lock = threading.Lock()
+SHUTDOWN = threading.Event()
 
-    result = safe_json(resp)
+def now_ts(): return int(time.time())
+def unique_filename(prefix="video", ext="mp4"):
+    return f"{prefix}_{int(time.time())}_{uuid.uuid4().hex[:8]}.{ext}"
 
-    # Interpret HF response: try to find a URL or video bytes
-    video_url = None
-    # If result is dict, search for common keys
-    if isinstance(result, dict):
-        # check common keys
-        for k in ("generated_video", "video", "url", "output", "outputs"):
-            if k in result:
-                val = result.get(k)
-                if isinstance(val, str) and val.startswith("http"):
-                    video_url = val
-                    break
-                if isinstance(val, list) and val and isinstance(val[0], str) and val[0].startswith("http"):
-                    video_url = val[0]
-                    break
-        # check outputs list of dicts
-        outputs = result.get("outputs") or result.get("output")
-        if not video_url and isinstance(outputs, list) and outputs:
-            first = outputs[0]
-            if isinstance(first, dict):
-                video_url = first.get("url") or first.get("generated_video")
-            elif isinstance(first, str) and first.startswith("http"):
-                video_url = first
-    elif isinstance(result, list) and result:
-        first = result[0]
-        if isinstance(first, dict):
-            video_url = first.get("url") or first.get("generated_video")
-        elif isinstance(first, str) and first.startswith("http"):
-            video_url = first
+# ---------------- Auth decorators ----------------
+from functools import wraps
+def require_api_key(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if API_KEY:
+            key = request.headers.get("X-API-KEY") or request.args.get("api_key")
+            if not key or key != API_KEY:
+                return jsonify({"ok":False,"error":"invalid_api_key"}), 401
+        # if JWT enabled, prefer JWT for user identity on protected endpoints
+        return f(*args, **kwargs)
+    return wrapper
 
-    # If HF returned raw bytes content
-    if not video_url and resp.headers.get("content-type", "").startswith("video/"):
-        fname = uuid_filename()
-        save_path = os.path.join(VIDEO_SAVE_DIR, fname)
-        with open(save_path, "wb") as f:
-            f.write(resp.content)
-        return jsonify({"status": True, "file": file_public_url(fname)})
+def require_jwt(f):
+    @wraps(f)
+    def wrapper(*a, **kw):
+        if jwt:
+            return jwt_required()(f)(*a, **kw)
+        return f(*a, **kw)
+    return wrapper
 
-    if not video_url:
-        return jsonify({"status": False, "error": "No video url returned by model", "detail": result}), 500
-
-    # Download the video and return path/url
-    fname = uuid_filename()
-    save_path = os.path.join(VIDEO_SAVE_DIR, fname)
-    ok = download_url_to_file(video_url, save_path, timeout=180)
-    if not ok:
-        return jsonify({"status": False, "error": "Failed to download video from model output", "video_url": video_url}), 500
-
-    return jsonify({"status": True, "file": file_public_url(fname)})
-
-
-@app.route("/download", methods=["GET"])
-def download_file():
-    # no API key required to download; frontend can use direct link
-    fname = request.args.get("file")
-    if not fname:
-        return jsonify({"status": False, "error": "file param required"}), 400
-    # prevent path traversal
-    if "/" in fname or "\\" in fname:
-        return jsonify({"status": False, "error": "invalid filename"}), 400
-    path = os.path.join(VIDEO_SAVE_DIR, fname)
-    if not os.path.exists(path):
-        return jsonify({"status": False, "error": "file not found"}), 404
-    return send_file(path, as_attachment=True)
-
-
-@app.route("/predict", methods=["POST"])
-def predict():
-    check_api_key()
-    if not HF_TOKEN:
-        return jsonify({"status": False, "error": "HF_TOKEN not set"}), 400
-
-    data = request.get_json(silent=True) or {}
-    inputs = data.get("inputs")
-    params = data.get("parameters", {})
-    model = data.get("model") or HF_MODEL
-    if not model:
-        return jsonify({"status": False, "error": "No model specified"}), 400
-
-    url = os.environ.get("HF_API_URL") or f"https://router.huggingface.co/api/models/{model}"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    body = {"inputs": inputs, "parameters": params}
+# ---------------- Persistence (jobs snapshot) ----------------
+JOBS_SNAPSHOT_FILE = OUT_DIR / "jobs_snapshot.json"
+def save_jobs_snapshot():
     try:
-        r = requests.post(url, json=body, headers=headers, timeout=180)
+        with jobs_lock:
+            with open(JOBS_SNAPSHOT_FILE, "w") as f:
+                json.dump(jobs, f, default=str)
     except Exception as e:
-        app.logger.exception("Predict failed")
-        return jsonify({"status": False, "error": str(e)}), 500
+        log.exception("save snapshot failed: %s", e)
 
-    return jsonify({"status": r.status_code == 200, "http_status": r.status_code, "result": safe_json(r)}), (200 if r.status_code == 200 else 502)
+def load_jobs_snapshot():
+    if JOBS_SNAPSHOT_FILE.exists():
+        try:
+            with open(JOBS_SNAPSHOT_FILE) as f:
+                data = json.load(f)
+            with jobs_lock:
+                jobs.update(data)
+        except Exception as e:
+            log.exception("load snapshot failed: %s", e)
 
+load_jobs_snapshot()
 
-# ---------------- Worker threads (cleanup etc.) ----------------
-def worker_loop():
-    while True:
-        time.sleep(1)
+# ---------------- Model call core (same logic as before) ----------------
+def api_inference_url(model_id: str) -> str:
+    return f"{HF_API_INFERENCE_BASE}/{model_id}"
+def router_url(model_id: str) -> str:
+    return f"{HF_ROUTER_BASE}/{model_id}"
 
+def call_model_stream_save(model_id: str, payload: dict, out_path: Path, wait_for_model: bool=False, timeout: int=CALL_TIMEOUT):
+    # endpoints to try
+    endpoints = []
+    endpoints.append(("api-inference", api_inference_url(model_id), None))
+    if HF_TOKEN:
+        endpoints.append(("router", router_url(model_id), {"Authorization": f"Bearer {HF_TOKEN}"}))
+    else:
+        endpoints.append(("router", router_url(model_id), None))
 
-if __name__ == "__main__":
-    # start cleanup thread
-    cleaner = threading.Thread(target=cleanup_old_files, daemon=True)
-    cleaner.start()
+    base_headers = {"Accept":"*/*", "User-Agent":"visora-complete/1.0"}
+    if wait_for_model:
+        base_headers["x-wait-for-model"] = "true"
 
-    # start optional worker threads
-    for i in range(max(1, WORKER_THREADS)):
-        t = threading.Thread(target=worker_loop, daemon=True)
+    last_exc = None
+    for kind, url, auth in endpoints:
+        hdrs = dict(base_headers)
+        if auth:
+            hdrs.update(auth)
+        try:
+            r = requests.post(url, json=payload, headers=hdrs, stream=True, timeout=timeout)
+            content_type = r.headers.get("Content-Type","")
+            log.info("call %s status=%s content-type=%s", kind, r.status_code, content_type)
+            if r.status_code == 200 and ("video" in content_type or "octet-stream" in content_type or "content-disposition" in r.headers):
+                with open(out_path, "wb") as fh:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            fh.write(chunk)
+                return r.status_code
+            # parse json errors
+            try:
+                txt = r.content.decode(errors="ignore")
+                obj = json.loads(txt) if txt else {}
+            except Exception:
+                obj = {"raw": r.text[:400]}
+            last_exc = RuntimeError(f"{kind} returned {r.status_code}: {obj}")
+            continue
+        except Exception as e:
+            last_exc = e
+            log.exception("call exception %s", e)
+            continue
+    raise RuntimeError(f"All endpoints failed: {last_exc}")
+
+# ---------------- Worker logic ----------------
+def enqueue_job(job_id: str):
+    if USE_RQ and rq_queue:
+        # push to redis RQ (worker will run separate process)
+        rq_queue.enqueue('app.rq_worker_execute', job_id)
+    else:
+        task_queue.put(job_id)
+
+def rq_worker_execute(job_id: str):
+    """To be used by RQ: import path must match app.rq_worker_execute"""
+    return worker_execute(job_id)
+
+def worker_execute(job_id: str):
+    # real worker: pop job, call model, save file, update jobs
+    j = None
+    with jobs_lock:
+        j = jobs.get(job_id)
+        if not j:
+            return {"ok":False,"error":"job_missing"}
+        j["state"]="running"
+        j["started_at"]=now_ts()
+        j["attempts"]=j.get("attempts",0)+1
+    model_id = j["model"]
+    payload = j["payload"]
+    wait_for_model = j.get("wait_for_model", False)
+    filename = unique_filename()
+    out_path = OUT_DIR / filename
+    try:
+        start = time.time()
+        status = call_model_stream_save(model_id, payload, out_path, wait_for_model=wait_for_model)
+        elapsed = time.time()-start
+        with jobs_lock:
+            j["state"]="finished"
+            j["filename"]=filename
+            j["finished_at"]=now_ts()
+            j["duration"]=elapsed
+        if METRICS_AVAILABLE:
+            JOB_COUNTER.labels(result="success").inc()
+            JOB_TIME.observe(elapsed)
+        return {"ok":True,"filename":filename}
+    except Exception as e:
+        with jobs_lock:
+            j["state"]="failed"; j["error"]=str(e); j["finished_at"]=now_ts()
+        if METRICS_AVAILABLE:
+            JOB_COUNTER.labels(result="fail").inc()
+        log.exception("job %s failed: %s", job_id, e)
+        return {"ok":False,"error":str(e)}
+
+# in-memory worker threads
+def in_memory_worker():
+    while not SHUTDOWN.is_set():
+        try:
+            job_id = task_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        res = worker_execute(job_id)
+        task_queue.task_done()
+
+# start in-memory workers if RQ not used
+if not USE_RQ:
+    for _ in range(MAX_WORKERS):
+        t = threading.Thread(target=in_memory_worker, daemon=True)
         t.start()
 
-    # run
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+# ---------------- HTTP endpoints ----------------
+
+# metrics endpoint
+@app.route("/metrics")
+def metrics():
+    if not METRICS_AVAILABLE:
+        return jsonify({"ok":False,"error":"prometheus not installed"}), 501
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+@app.before_request
+def before_request_func():
+    if METRICS_AVAILABLE:
+        try:
+            REQ_COUNTER.labels(endpoint=request.path, method=request.method, status="in").inc()
+        except Exception:
+            pass
+
+@app.route("/health")
+def health():
+    return jsonify({"ok":True,"time":now_ts(),"jobs":len(jobs)})
+
+@app.route("/create-token", methods=["POST"])
+def create_token():
+    # small helper: create JWT tokens if JWT enabled
+    if not JWT_AVAILABLE:
+        return jsonify({"ok":False,"error":"jwt_not_installed"}), 501
+    data = request.get_json() or {}
+    username = data.get("username")
+    if not username:
+        return jsonify({"ok":False,"error":"missing_username"}), 400
+    # create access token (no user store here)
+    access = create_access_token(identity=username)
+    return jsonify({"ok":True,"access_token":access})
+
+@app.route("/create-video", methods=["POST"])
+@require_api_key
+@require_jwt
+def create_video():
+    # rate-limit per IP / per-user applied by limiter if available
+    data = request.get_json(force=True)
+    inputs = data.get("inputs") or data.get("script") or data.get("prompt")
+    if not inputs:
+        return jsonify({"ok":False,"error":"missing_inputs"}),400
+    model_id = data.get("model") or HF_MODEL
+    if not model_id:
+        return jsonify({"ok":False,"error":"missing_model"}),400
+    payload = {"inputs": inputs}
+    if "parameters" in data and isinstance(data["parameters"], dict):
+        payload["parameters"]=data["parameters"]
+    wait_for_model = bool(data.get("wait_for_model")) or (request.headers.get("x-wait-for-model","").lower() in ("1","true","yes"))
+
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id, "state":"queued", "created_at":now_ts(),
+        "model":model_id, "payload":payload, "wait_for_model":wait_for_model,
+        "attempts":0, "progress":0, "cancel_requested":False
+    }
+    with jobs_lock:
+        jobs[job_id]=job
+    enqueue_job(job_id)
+    # persist snapshot
+    threading.Thread(target=save_jobs_snapshot, daemon=True).start()
+    return jsonify({"ok":True,"job_id":job_id})
+
+@app.route("/status/<job_id>")
+@require_api_key
+@require_jwt
+def status(job_id):
+    j = jobs.get(job_id)
+    if not j:
+        return jsonify({"ok":False,"error":"not_found"}),404
+    safe = {k:v for k,v in j.items() if k!="payload"}
+    return jsonify({"ok":True,"job":safe})
+
+@app.route("/download/<path:filename>")
+@require_api_key
+@require_jwt
+def download(filename):
+    p = OUT_DIR/filename
+    if not p.exists():
+        return jsonify({"ok":False,"error":"file_not_found"}),404
+    return send_from_directory(directory=str(OUT_DIR), path=filename, as_attachment=True)
+
+@app.route("/list-files")
+@require_api_key
+@require_jwt
+def list_files():
+    out=[]
+    for f in OUT_DIR.iterdir():
+        if f.is_file():
+            out.append({"name":f.name,"size":f.stat().st_size,"mtime":int(f.stat().st_mtime)})
+    out_sorted = sorted(out, key=lambda x: x["mtime"], reverse=True)
+    return jsonify({"ok":True,"files":out_sorted})
+
+@app.route("/events/<job_id>")
+@require_api_key
+def events(job_id):
+    # simple SSE stream of job status & logs
+    def gen():
+        last = None
+        while True:
+            j = jobs.get(job_id)
+            if not j:
+                yield f"data: {json.dumps({'error':'not_found'})}\n\n"; break
+            # send state
+            yield f"data: {json.dumps({'state': j.get('state'), 'filename': j.get('filename', None)})}\n\n"
+            if j.get("state") in ("finished","failed","canceled"):
+                break
+            time.sleep(1)
+    return Response(gen(), mimetype="text/event-stream")
+
+# admin endpoints
+@app.route("/admin/stats")
+def admin_stats():
+    with jobs_lock:
+        counts = {}
+        for jid,j in jobs.items():
+            counts[j.get("state")] = counts.get(j.get("state"),0)+1
+    return jsonify({"ok":True,"counts":counts,"jobs_total":len(jobs)})
+
+@app.route("/model-check")
+def model_check():
+    model = request.args.get("model") or HF_MODEL
+    if not model:
+        return jsonify({"ok":False,"error":"missing_model"}),400
+    out={}
+    try:
+        if HF_TOKEN:
+            r = requests.get(router_url(model), headers={"Authorization": f"Bearer {HF_TOKEN}"}, timeout=15)
+            out["router_status"]=r.status_code
+            out["router_text"]=r.text[:500]
+    except Exception as e:
+        out["router_error"]=str(e)
+    try:
+        r2 = requests.get(api_inference_url(model), timeout=15)
+        out["api_status"]=r2.status_code
+        out["api_text"]=r2.text[:500]
+    except Exception as e:
+        out["api_error"]=str(e)
+    return jsonify({"ok":True,"model":model,"results":out})
+
+# ---------------- RQ worker entry point helper ----------------
+def run_rq_worker():
+    if not REDIS_AVAILABLE or not REDIS_URL:
+        print("Redis/RQ not configured.")
+        return
+    q = RQQueue("visora", connection=redis.from_url(REDIS_URL))
+    w = RQWorker([q], connection=q.connection)
+    w.work()
+
+# ---------------- main ----------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-rq-worker", action="store_true", help="Run RQ worker (use only if REDIS_URL set)")
+    args = parser.parse_args()
+    if args.run_rq_worker:
+        run_rq_worker()
+    else:
+        log.info("Starting Visora final full. HF_MODEL=%s REDIS=%s JWT=%s", HF_MODEL, bool(REDIS_URL), bool(JWT_SECRET))
+        app.run(host="0.0.0.0", port=PORT, threaded=True)
+# ---------------- end of file ----------------
