@@ -44,7 +44,7 @@ REPLICATE_POLL_TIMEOUT = int(os.environ.get("REPLICATE_POLL_TIMEOUT", 300))
 
 # Construct HF_API_URL if not provided
 if not HF_API_URL and HF_MODEL:
-    HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+    HF_API_URL = f"https://router.huggingface.co/api/models/{HF_MODEL}"
 
 app = Flask(__name__)
 CORS(app)
@@ -117,6 +117,37 @@ def check_api_key():
         if not key or key != API_KEY:
             abort(401, description="Invalid or missing API key")
 
+# --- HuggingFace router call (replace old api-inference usage) ---
+def hf_create_and_wait(model, input_payload, timeout=300):
+    """
+    Call Hugging Face Router endpoint for model inference and return outputs.
+    model: string like "owner/model" or "owner/model:version" if versioned.
+    input_payload: dict to send as JSON input.
+    """
+    hf_token = os.environ.get("HF_TOKEN", "").strip()
+    if not hf_token:
+        raise RuntimeError("HF_TOKEN not set in env")
+
+    url = f"https://router.huggingface.co/api/models/{model}"
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        resp = requests.post(url, json=input_payload, headers=headers, timeout=60)
+    except Exception as e:
+        raise RuntimeError(f"HuggingFace request failed: {e}")
+
+    if resp.status_code >= 400:
+        # bubble up message for easier debugging
+        raise RuntimeError(f"HF error {resp.status_code}: {resp.text}")
+
+    # router usually returns the model output directly (could be bytes/json)
+    try:
+        return resp.json()  # if JSON
+    except Exception:
+        return resp.content  # fallback (e.g., raw bytes)
 
 # ---------------- Routes ----------------
 @app.route("/health", methods=["GET"])
