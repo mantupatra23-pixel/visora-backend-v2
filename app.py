@@ -20,11 +20,17 @@ from flask import Flask, request, jsonify, send_file, abort
 from flask_cors import CORS
 
 # ---------------- Config from env ----------------
-HF_TOKEN = os.environ.get("HF_TOKEN", "").strip() or None
-HF_MODEL = os.environ.get("HF_MODEL", "").strip() or None
-HF_API_URL = os.environ.get("HF_API_URL", "").strip() or None  # optional override
+
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+HF_MODEL = os.environ.get("HF_MODEL", "cerspense/zeroscope-v2-xl").strip()
+
+# HF_API_URL: agar env me diya nahi hai to router URL auto banega
+HF_API_URL = os.environ.get("HF_API_URL", "").strip()
+if not HF_API_URL:
+    HF_API_URL = f"https://router.huggingface.co/api/models/{HF_MODEL}"
+
 SERVICE_BASE_URL = os.environ.get("SERVICE_BASE_URL", "").strip() or None
-API_KEY = os.environ.get("API_KEY", "").strip() or None  # optional simple auth for your frontend
+API_KEY = os.environ.get("API_KEY", "").strip() or None
 
 VIDEO_SAVE_DIR = os.environ.get("VIDEO_SAVE_DIR", "videos")
 os.makedirs(VIDEO_SAVE_DIR, exist_ok=True)
@@ -33,22 +39,17 @@ os.makedirs(VIDEO_SAVE_DIR, exist_ok=True)
 MAX_PROMPT_LENGTH = int(os.environ.get("MAX_PROMPT_LENGTH", 5000))
 MAX_SCENES = int(os.environ.get("MAX_SCENES", 10))
 MAX_VIDEO_AGE_DAYS = int(os.environ.get("MAX_VIDEO_AGE_DAYS", 7))
-MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", 200))  # not strictly enforced for downloads
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", 200))
 
 # worker / cleanup
 WORKER_THREADS = int(os.environ.get("WORKER_THREADS", 1))
 
-# Polls/timeouts (kept for compatibility; replicate removed)
+# polls/timeouts (replicate removed, keep for compatibility)
 REPLICATE_POLL_INTERVAL = float(os.environ.get("REPLICATE_POLL_INTERVAL", 3))
 REPLICATE_POLL_TIMEOUT = int(os.environ.get("REPLICATE_POLL_TIMEOUT", 300))
 
-# Construct HF_API_URL if not provided
-if not HF_API_URL and HF_MODEL:
-    HF_API_URL = f"https://router.huggingface.co/api/models/{HF_MODEL}"
-
 app = Flask(__name__)
 CORS(app)
-
 
 # ---------------- Helpers ----------------
 def safe_json(resp):
@@ -170,7 +171,7 @@ def model_check():
     if not model:
         return jsonify({"status": False, "error": "No model provided and no HF_MODEL set"}), 400
 
-    url = os.environ.get("HF_API_URL") or f"https://api-inference.huggingface.co/models/{model}"
+    url = os.environ.get("HF_API_URL") or f"https://router.huggingface.co/api/models/{model}"
     try:
         headers = {"Authorization": f"Bearer {HF_TOKEN}"}
         r = requests.head(url, headers=headers, timeout=15)
@@ -209,7 +210,7 @@ def create_video():
     if not model:
         return jsonify({"status": False, "error": "No model configured (HF_MODEL)"}), 400
 
-    hf_url = os.environ.get("HF_API_URL") or f"https://api-inference.huggingface.co/models/{model}"
+    hf_url = os.environ.get("HF_API_URL") or f"https://router.huggingface.co/api/models/{model}"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
     payload = {
         "inputs": prompt,
@@ -311,7 +312,7 @@ def predict():
     if not model:
         return jsonify({"status": False, "error": "No model specified"}), 400
 
-    url = os.environ.get("HF_API_URL") or f"https://api-inference.huggingface.co/models/{model}"
+    url = os.environ.get("HF_API_URL") or f"https://router.huggingface.co/api/models/{model}"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     body = {"inputs": inputs, "parameters": params}
     try:
