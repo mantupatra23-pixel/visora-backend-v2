@@ -28,7 +28,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import sys
-sys.path.append("/opt/render/project/src/engine")
+sys.path.append(str(Path(__file__).resolve().parent))
 
 from flask import Flask, request, jsonify, send_file, abort
 
@@ -180,6 +180,63 @@ def combine_audio_and_video(primary_video_path, audio_assets, out_path):
     # fallback: copy primary to out_path
     shutil.copyfile(str(primary_video_path), str(out_path))
     return str(out_path)
+
+# main render scene function (3D/render engine) -> returns dict with details
+try:
+    from engine.generator_3d import render_scene
+except Exception:
+    try:
+        from engine.video_engine import render_scene
+    except Exception:
+        render_scene = None
+
+# Character engine (blender-based)
+try:
+    from engine.character_engine import CharacterEngine
+except Exception:
+    CharacterEngine = None
+
+# Lip-sync engine
+try:
+    from engine.lipsync import apply_lipsync
+except Exception:
+    apply_lipsync = None
+
+# Voice clone / TTS engine
+try:
+    from engine.voiceclone import synthesize_voice
+except Exception:
+    synthesize_voice = None
+
+# Motion engine
+try:
+    from engine.motion_engine import MotionEngine
+except Exception:
+    MotionEngine = None
+
+# Physics engine
+try:
+    from engine.physics_engine import PhysicsEngine
+except Exception:
+    PhysicsEngine = None
+
+# Environment builder
+try:
+    from engine.environment_engine import EnvironmentEngine
+except Exception:
+    EnvironmentEngine = None
+
+# Sound engine (Foley + ambience)
+try:
+    from engine.sound_engine import SoundEngine
+except Exception:
+    SoundEngine = None
+
+# Postprocess engine (4K upscaler + color grading)
+try:
+    from engine.postprocess import optimize_video
+except Exception:
+    optimize_video = None
 
 # -------------------- BACKGROUND WORKER --------------------
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
