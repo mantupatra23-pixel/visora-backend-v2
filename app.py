@@ -34,8 +34,8 @@ from flask import Flask, request, jsonify, send_file, abort
 
 # -------------------- CONFIG --------------------
 BASE_DIR = Path(__file__).resolve().parent
-JOBS_DIR = BASE_DIR / "jobs"
-OUTPUT_DIR = BASE_DIR / "public" / "videos"
+JOBS_DIR = Path("/opt/render/project/src/jobs")
+OUTPUT_DIR = Path("/opt/render/project/src/public/videos")
 
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
 ALLOWED_PRESETS = ["reel", "short", "cinematic", "fullhd", "ultra"]
