@@ -51,7 +51,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # -------------------- IMPORT YOUR ENGINES (with graceful fallback) --------------------
 # parse_script: returns scene_spec dict from text/script
 try:
-       from parse_script import parse_script
+       from engine.parse_script import parse_script
 except Exception:
     parse_script = None
 
