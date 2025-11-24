@@ -27,6 +27,8 @@ import traceback
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import sys
+sys.path.append(str(Path(__file__).resolve().parent / "engine"))
 
 from flask import Flask, request, jsonify, send_file, abort
 
@@ -49,7 +51,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # -------------------- IMPORT YOUR ENGINES (with graceful fallback) --------------------
 # parse_script: returns scene_spec dict from text/script
 try:
-    from engine.parse_script import parse_script
+       from parse_script import parse_script
 except Exception:
     parse_script = None
 
