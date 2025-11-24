@@ -28,7 +28,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import sys
-sys.path.append(str(Path(__file__).resolve().parent / "engine"))
+sys.path.append("/opt/render/project/src/engine")
 
 from flask import Flask, request, jsonify, send_file, abort
 
