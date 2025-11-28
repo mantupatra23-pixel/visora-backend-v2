@@ -1,0 +1,16 @@
+{
+  "id": "da40a725-db6f-40a9-95a5-0782b626390c",
+  "script_text": "Hello world from local render!",
+  "preset": "reel",
+  "avatar_reference_path": null,
+  "status": "queued",
+  "meta": {
+    "manual_started": true,
+    "manual_started_at": "2025-11-28T04:41:19.818262"
+  },
+  "result": {},
+  "created_at": "2025-11-28T04:40:36.848371",
+  "completed_at": null,
+  "error": null,
+  "render_settings": {}
+}

@@ -1,0 +1,13 @@
+{
+  "id": "3afb195a-cb20-44c1-832b-6eb22d8e1d28",
+  "script_text": "hello world",
+  "preset": "reel",
+  "avatar_reference_path": null,
+  "status": "created",
+  "meta": {},
+  "result": {},
+  "created_at": "2025-11-28T06:05:56.987285",
+  "completed_at": null,
+  "error": null,
+  "render_settings": {}
+}
