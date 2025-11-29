@@ -1,11 +1,0 @@
---2025-11-29 14:22:18--  https://www.dropbox.com/scl/fi/j0qxk5m4u1qj11ayqtns1/wav2lip.pth?rlkey=j4ijw3y2h8y3d5tnm7e5up0f1
-Resolving www.dropbox.com (www.dropbox.com)... 162.125.81.18, 2620:100:6031:18::a27d:5112
-Connecting to www.dropbox.com (www.dropbox.com)|162.125.81.18|:443... connected.
-HTTP request sent, awaiting response... 200 OK
-Length: unspecified [text/html]
-Saving to: ‘wav2lip.pth?rlkey=j4ijw3y2h8y3d5tnm7e5up0f1’
-
-      wav2li            0  --.-KB/s                    wav2lip       72.74K   321KB/s               wav2lip.pth?      181.29K   479KB/s    in 0.4s    
-
-2025-11-29 14:22:19 (479 KB/s) - ‘wav2lip.pth?rlkey=j4ijw3y2h8y3d5tnm7e5up0f1’ saved [185636]
-
