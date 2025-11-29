@@ -9,6 +9,7 @@ itsdangerous==2.2.0
 click==8.1.7
 gunicorn==21.0.1
 flask-cors==3.0.10
+celery==5.5.0
 
 ###############################
 # 🗄 Database + ORM
