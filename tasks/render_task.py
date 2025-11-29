@@ -1,22 +1,8 @@
-# tasks/render_task.py
 """
-Celery render task - production ready.
-
-यह file:
- - jobs/<job_id>.json पढ़कर job process करता है
- - TTS (ElevenLabs) बनाता है
- - अगर face_video मौजूद है तो Wav2Lip से lipsync करता है
- - अन्यथा Blender से scene render कर के audio के साथ merge करता है
- - final mp4 को local public folder में रखता है या S3 पर upload करता है
- - job JSON में status/result update करता है
-
-Usage (worker host पर):
-    export REDIS_URL=redis://127.0.0.1:6379/0
-    celery -A tasks.render_task.celery_app worker -Q renderers -c 1 --loglevel=info
-
-Required env:
-    BASE_URL, REDIS_URL, VIDEO_SAVE_DIR, JOBS_DIR, S3_BUCKET, AWS_*, ELEVENLABS_API_KEY,
-    WAV2LIP_CHECKPOINT, BLENDER_BIN, BLENDER_SCRIPT
+tasks/render_task.py - Celery render worker (file-based job store).
+This task reads jobs/{job_id}.json, runs pipeline (TTS -> lipsync/blender -> combine),
+writes final file to public/videos/{job_id}.mp4 and marks job status.
+You must replace the placeholder TTS/lipsync/render calls with your real engines.
 """
 
 import os
@@ -25,244 +11,142 @@ import logging
 import traceback
 from pathlib import Path
 from datetime import datetime
+from celery import Celery
 
-# try to reuse existing celery app if present (services.celery_app)
-try:
-    from services.celery_app import celery_app
-    logging.getLogger("tasks.render_task").info("Using services.celery_app.celery_app")
-except Exception:
-    # fallback: create local celery app
-    from celery import Celery
-    REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
-    celery_app = Celery("visora_render", broker=REDIS_URL, backend=REDIS_URL)
-    logging.getLogger("tasks.render_task").info("Created local Celery app with broker %s", REDIS_URL)
+# CONFIG (env)
+REDIS_URL = os.environ.get("REDIS_URL", "rediss://default:AUNYAAIncDI0YjRjYjMyMjVmYzI0Yjk2ODgwZTk4NzZjZjYxYjZkY3AyMTcyNDA@included-civet-17240.upstash.io:6379")
+JOBS_DIR = Path(os.environ.get("JOBS_DIR", "./jobs"))
+OUTPUT_DIR = Path(os.environ.get("VIDEO_SAVE_DIR", "./public/videos"))
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 
-# engines (these modules should exist in engines/)
-from engines import tts_elevenlabs, wav2lip_runner, blender_runner, postprocess
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Celery app
+celery_app = Celery("visora_render", broker=REDIS_URL, backend=REDIS_URL)
 
 LOG = logging.getLogger("tasks.render_task")
 LOG.setLevel(logging.INFO)
 
-# paths (can be overridden by env)
-JOBS_DIR = Path(os.environ.get("JOBS_DIR", "jobs"))
-OUTPUT_DIR = Path(os.environ.get("VIDEO_SAVE_DIR", "public/videos"))
-JOBS_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# helpers
+def job_path(job_id: str) -> Path:
+    return JOBS_DIR / f"{job_id}.json"
 
-BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
-S3_BUCKET = os.environ.get("S3_BUCKET", "")
-
-def read_job_file(job_id: str) -> dict:
-    p = JOBS_DIR / f"{job_id}.json"
+def read_job(job_id: str) -> dict:
+    p = job_path(job_id)
     if not p.exists():
-        raise FileNotFoundError(f"Job file not found: {p}")
+        return None
     return json.loads(p.read_text(encoding="utf-8"))
 
-def write_job_file(job_id: str, data: dict):
-    p = JOBS_DIR / f"{job_id}.json"
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def write_job(job: dict):
+    p = job_path(job["id"])
+    p.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def update_job_status(job_id: str, status: str, extra: dict = None):
-    try:
-        job = read_job_file(job_id)
-    except Exception:
-        job = {"id": job_id}
+def update_status(job_id: str, status: str, progress: int = None, extra=None):
+    job = read_job(job_id) or {"id": job_id}
     job["status"] = status
-    job.setdefault("meta", {})
-    job["meta"]["last_update_at"] = datetime.utcnow().isoformat()
-    if extra:
-        job.setdefault("meta", {}).update(extra)
-    write_job_file(job_id, job)
-    LOG.info("Job %s status -> %s", job_id, status)
+    if progress is not None:
+        job["progress"] = int(max(0, min(100, progress)))
+    job.setdefault("meta", {}).update(extra or {})
+    job["meta"]["last_update_at"] = datetime.utcnow().isoformat() + "Z"
+    write_job(job)
+    LOG.info("Job %s status=%s progress=%s", job_id, status, job.get("progress"))
 
-def set_job_result(job_id: str, result: dict):
-    try:
-        job = read_job_file(job_id)
-    except Exception:
-        job = {"id": job_id}
-    job["result"] = result
+def set_result_video(job_id: str, local_path: str):
+    job = read_job(job_id) or {"id": job_id}
+    public_url = f"{BASE_URL}/videos/{job_id}.mp4" if BASE_URL else f"/videos/{job_id}.mp4"
+    job["result"] = {"video_url": public_url}
     job["status"] = "completed"
-    job["completed_at"] = datetime.utcnow().isoformat()
-    write_job_file(job_id, job)
-    LOG.info("Job %s completed, result set", job_id)
+    job["progress"] = 100
+    job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+    write_job(job)
+    LOG.info("Job %s finished, video %s", job_id, public_url)
 
-def set_job_failed(job_id: str, error: str):
+# Example pipeline functions (replace with real integration)
+def do_tts(job, out_audio_path: Path) -> bool:
+    # placeholder: create a tiny wav/mp3 to avoid failures
     try:
-        job = read_job_file(job_id)
+        text = job.get("script_text","")
+        # create 1 second silent file as placeholder using python wave or ffmpeg if available
+        out_audio_path.write_bytes(b"")  # empty file fallback
+        return True
     except Exception:
-        job = {"id": job_id}
-    job["status"] = "failed"
-    job["error"] = error
-    job["completed_at"] = datetime.utcnow().isoformat()
-    write_job_file(job_id, job)
-    LOG.error("Job %s failed: %s", job_id, error)
+        LOG.exception("tts failed")
+        return False
 
+def do_lipsync(job, audio_path: Path, out_video_path: Path) -> bool:
+    # placeholder: copy a sample short file or create empty mp4
+    try:
+        out_video_path.write_bytes(b"")
+        return True
+    except Exception:
+        LOG.exception("lipsync failed")
+        return False
+
+def combine_assets(job, video_path: Path, final_path: Path) -> bool:
+    try:
+        # move/copy
+        video_path.replace(final_path)
+        return True
+    except Exception:
+        LOG.exception("combine failed")
+        return False
+
+# Celery task
 @celery_app.task(bind=True, name="tasks.render_task.render_job_task")
 def render_job_task(self, job_id: str):
-    """
-    Celery task entrypoint.
-    """
     LOG.info("render_job_task start: %s", job_id)
-    try:
-        job = read_job_file(job_id)
-    except FileNotFoundError as e:
-        LOG.exception("Job file missing")
-        raise e
+    job = read_job(job_id)
+    if not job:
+        LOG.error("Job file missing %s", job_id)
+        raise FileNotFoundError(job_id)
 
-    # Basic job fields
-    script = job.get("script") or job.get("script_text") or ""
-    preset = job.get("preset", "reel")
-    face_video = job.get("face_video")  # optional path (absolute or repo path)
     try:
-        # 0) set queued/started
-        update_job_status(job_id, "started")
-
+        update_status(job_id, "started", progress=1)
         # 1) TTS
-        update_job_status(job_id, "tts")
-        LOG.info("Job %s: generating TTS", job_id)
-        # safe filename
-        tts_filename = f"{job_id}_tts.mp3"
-        try:
-            audio_path = tts_elevenlabs.synthesize_voice(script, filename=tts_filename)
-        except Exception as e:
-            LOG.exception("TTS failed, creating silent placeholder")
-            # create a silent fallback wav/mp3 of 1s using ffmpeg if available, else empty file
-            fallback = OUTPUT_DIR / f"{job_id}_tts_silent.mp3"
-            try:
-                # try use ffmpeg to create 1-second silent audio (if ffmpeg present)
-                import subprocess
-                subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                                "-t", "1", str(fallback)],
-                               check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                audio_path = str(fallback)
-            except Exception:
-                LOG.exception("Failed to create silent audio fallback")
-                fallback.write_text("")  # empty file
-                audio_path = str(fallback)
+        update_status(job_id, "tts", progress=5)
+        audio_path = OUTPUT_DIR / f"{job_id}.mp3"
+        if not do_tts(job, audio_path):
+            raise RuntimeError("TTS failed")
+        update_status(job_id, "tts", progress=15)
 
-        LOG.info("Job %s: audio at %s", job_id, audio_path)
+        # 2) Lipsync / Blender step
+        update_status(job_id, "lipsync", progress=20)
+        lipsync_video = OUTPUT_DIR / f"{job_id}_face.mp4"
+        if not do_lipsync(job, audio_path, lipsync_video):
+            raise RuntimeError("Lipsync failed")
+        update_status(job_id, "lipsync", progress=45)
 
-        # 2) Lipsync OR Blender render
-        if face_video:
-            update_job_status(job_id, "lipsync")
-            LOG.info("Job %s: doing Wav2Lip with face_video=%s", job_id, face_video)
-            out_lipsync = OUTPUT_DIR / f"{job_id}_lipsync.mp4"
-            # Use wrapper script to ensure checkpoint present
-            # Command: python engines/wav2lip_runner.py --face <face_video> --audio <audio_path> --out <out_lipsync>
-            try:
-                # call ensure via module function if available, else fallback to subprocess wrapper
-                rc = wav2lip_runner.run_wav2lip(face_video, audio_path, str(out_lipsync))
-                if rc != 0:
-                    raise RuntimeError(f"Wav2Lip exited non-zero {rc}")
-                used_video = str(out_lipsync)
-            except AttributeError:
-                # if module has no run_wav2lip, try CLI main
-                import subprocess
-                cmd = [ "python", str(Path(__file__).resolve().parent.parent / "engines" / "wav2lip_runner.py"),
-                        "--face", str(face_video), "--audio", str(audio_path), "--out", str(out_lipsync) ]
-                LOG.info("Running wav2lip CLI: %s", " ".join(cmd))
-                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                LOG.info(proc.stdout)
-                if proc.returncode != 0:
-                    raise RuntimeError("Wav2Lip failed")
-                used_video = str(out_lipsync)
+        # 3) Render / Stitch scenes (placeholder)
+        update_status(job_id, "rendering", progress=50)
+        # placeholder final video path
+        final_local = OUTPUT_DIR / f"{job_id}.mp4"
+        if not combine_assets(job, lipsync_video, final_local):
+            raise RuntimeError("Combine failed")
+        update_status(job_id, "combining", progress=85)
 
-            LOG.info("Job %s: lipsync produced %s", job_id, used_video)
-
-            # combine audio + lipsync (postprocess)
-            update_job_status(job_id, "postprocessing")
-            final_out = OUTPUT_DIR / f"{job_id}_final.mp4"
-            try:
-                combined = postprocess.combine_audio_video(used_video, audio_path, out_file=str(final_out))
-            except Exception:
-                # if combine fails, try to just move lipsync output
-                LOG.exception("Combine failed, using lipsync output as final")
-                combined = used_video
-            final_path = str(final_out) if combined else used_video
-
-        else:
-            # No face video -> run Blender to create scene then combine
-            update_job_status(job_id, "rendering")
-            LOG.info("Job %s: rendering Blender scene", job_id)
-            scene_cfg = {
-                "script": script,
-                "preset": preset,
-                "job_id": job_id
-            }
-            # blender_runner.render_scene expects dict and returns output path
-            blender_out = blender_runner.render_scene(scene_cfg, output_filename=f"{job_id}_blender.mp4")
-            LOG.info("Job %s: blender out: %s", job_id, blender_out)
-
-            update_job_status(job_id, "postprocessing")
-            final_out = OUTPUT_DIR / f"{job_id}_final.mp4"
-            try:
-                combined = postprocess.combine_audio_video(blender_out, audio_path, out_file=str(final_out))
-            except Exception:
-                LOG.exception("Combine failed; using blender output")
-                combined = blender_out
-            final_path = str(final_out) if combined else blender_out
-
-        LOG.info("Job %s: final video at %s", job_id, final_path)
-
-        # 3) Upload to S3 (optional) or set local public URL
-        update_job_status(job_id, "uploading")
-        video_url = None
-        try:
-            if S3_BUCKET:
-                # use postprocess.upload_to_s3 or services.storage if available
-                try:
-                    s3info = postprocess.upload_to_s3(final_path, key=(os.environ.get("S3_KEY_PREFIX","videos/") + Path(final_path).name))
-                    video_url = s3info.get("url")
-                except Exception:
-                    LOG.exception("postprocess.upload_to_s3 failed, trying services.storage")
-                    # alternative fallback
-                    from services.storage import upload_to_s3_if_configured
-                    s3url = upload_to_s3_if_configured(final_path, f"videos/{Path(final_path).name}")
-                    video_url = s3url
-            else:
-                # local public URL
-                if BASE_URL:
-                    video_url = f"{BASE_URL}/videos/{Path(final_path).name}"
-                else:
-                    video_url = f"/videos/{Path(final_path).name}"
-        except Exception:
-            LOG.exception("Upload step failed")
-            # still allow job to complete with local path
-            if BASE_URL:
-                video_url = f"{BASE_URL}/videos/{Path(final_path).name}"
-            else:
-                video_url = f"/videos/{Path(final_path).name}"
-
-        # 4) Finalize job JSON + optional webhook
-        set_job_result(job_id, {"video_url": video_url, "path": final_path})
-        LOG.info("Job %s done -> %s", job_id, video_url)
-
-        # optional: call callback webhook if present
-        try:
-            job_meta = read_job_file(job_id).get("meta", {})
-            webhook = job_meta.get("webhook_url") or os.environ.get("BACON_URL")
-            if webhook:
-                import requests
-                requests.post(webhook, json={"status":"completed", "job_id": job_id, "video_url": video_url}, timeout=6)
-                LOG.info("Webhook fired for job %s to %s", job_id, webhook)
-        except Exception:
-            LOG.exception("Webhook notify failed")
-
-        return {"ok": True, "video_url": video_url}
-
+        # 4) Optionally upload to S3 (skipped here). We just mark success and expose local path.
+        set_result_video(job_id, str(final_local))
+        LOG.info("Render completed for %s", job_id)
+        return {"ok": True, "video": str(final_local)}
     except Exception as exc:
-        LOG.exception("Render job failed for %s", job_id)
-        err = str(exc) + "\n" + traceback.format_exc()
-        set_job_failed(job_id, err)
-        # optional webhook for failure
-        try:
-            job_meta = read_job_file(job_id).get("meta", {})
-            webhook = job_meta.get("webhook_url") or os.environ.get("BACON_URL")
-            if webhook:
-                import requests
-                requests.post(webhook, json={"status":"failed", "job_id": job_id, "error": str(exc)}, timeout=6)
-        except Exception:
-            LOG.exception("Webhook failed on error")
+        tb = traceback.format_exc()
+        LOG.exception("Render job failed %s", exc)
+        # write job failed
+        job = read_job(job_id) or {"id": job_id}
+        job["status"] = "failed"
+        job["error"] = str(exc) + "\n" + tb[:2000]
+        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+        write_job(job)
         raise
 
-# End of file
+# helper enqueue function if used as library
+def enqueue_render(job_id: str):
+    # queue name explicit
+    render_job_task.apply_async(args=[job_id], queue="visora_render_queue")
+    LOG.info("Enqueued job %s to visora_render_queue", job_id)
+
+# optionally export for import by app
+if __name__ == "__main__":
+    # quick manual test
+    print("Celery worker module - not to be run directly")

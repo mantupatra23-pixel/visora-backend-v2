@@ -1,21 +1,29 @@
-from celery import Celery
+# services/celery_app.py
 import os
+from celery import Celery
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
 celery_app = Celery(
     "visora",
     broker=REDIS_URL,
-    backend=REDIS_URL
+    backend=REDIS_URL,
 )
 
+# Recommended Celery config (tune as needed)
 celery_app.conf.update(
-    task_serializer="json",
-    result_serializer="json",
-    accept_content=["json"],
-    worker_prefetch_multiplier=1,
     task_acks_late=True,
-    broker_connection_retry_on_startup=True,
-    task_time_limit=60*60*4,
-    task_soft_time_limit=60*60*3+30
+    worker_prefetch_multiplier=1,
+    task_reject_on_worker_lost=True,
+    result_expires=3600,
+    task_track_started=True,
 )
+
+# Optional: periodic cleanup schedule example
+celery_app.conf.beat_schedule = {
+    "cleanup-old-jobs-every-hour": {
+        "task": "tasks.housekeeping.cleanup_old_jobs",
+        "schedule": 3600.0,
+        "args": ()
+    }
+}
