@@ -1,127 +1,171 @@
 # services/celery_app.py
+"""
+Celery app factory for Visora backend.
+
+Usage:
+    from services.celery_app import celery
+    # or create a new celery with make_celery('name')
+
+This file:
+ - Reads REDIS_URL and optional CELERY variables from environment.
+ - Detects TLS (rediss://) and sets broker_use_ssl / result_backend SSL options.
+ - Autodiscovers tasks in common modules (adjust `included_modules` as needed).
+ - Configures robust serializers, task time limits, concurrency-safe settings, logging.
+"""
+
 import os
+import ssl
 import logging
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, urlunparse
 
-from celery import Celery, Task
+from celery import Celery
 
-logger = logging.getLogger("visora.celery")
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+LOG = logging.getLogger("visora.celery")
+LOG.setLevel(logging.INFO)
+if not LOG.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s:%(name)s: %(message)s"))
+    LOG.addHandler(ch)
 
-# Read broker/result backend from env (set REDIS_URL in env)
-REDIS_URL = os.environ.get("REDIS_URL", os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0"))
 
-def _make_celery(broker_url: str, backend_url: str = None):
+def _normalize_redis_url(redis_url: str) -> str:
     """
-    Create a Celery app instance with safe defaults.
-    Handles 'rediss://' (ssl) by setting broker_use_ssl when needed.
+    Normalize the redis URL so Celery can use it as broker/result_backend.
+    Celery accepts 'redis://' or 'rediss://'. Upstash provides 'rediss://...'.
     """
-    broker_opts = {}
+    if not redis_url:
+        return None
+    parsed = urlparse(redis_url)
+    # If URL contains query params (like ?ssl_cert_reqs=...), keep them
+    return urlunparse(parsed)
+
+
+def _ssl_config_from_url(redis_url: str):
+    """
+    Return broker_use_ssl dict and backend_use_ssl flag based on the url scheme.
+    If scheme is 'rediss', return cert_reqs=CERT_NONE by default (safer to require CERT_REQUIRED in prod).
+    """
+    if not redis_url:
+        return None
+
+    parsed = urlparse(redis_url)
+    scheme = parsed.scheme.lower()
+
+    # default: no ssl settings
     broker_use_ssl = None
 
-    parsed = urlparse(broker_url)
-    if parsed.scheme.startswith("rediss"):
-        # Many hosted redis services don't provide certs - default to not verifying
-        # If you want strict verification, set ssl_cert_reqs via query param or change here.
-        broker_use_ssl = {"ssl_cert_reqs": False}
+    if scheme in ("rediss", "rediss+srv"):
+        # Use python ssl module constants. Upstash TLS sometimes requires disabling cert verify
+        # if you want to skip verification: ssl.CERT_NONE
+        # For production with proper CA, prefer ssl.CERT_REQUIRED
+        ssl_cert_reqs_env = os.getenv("REDIS_SSL_CERT_REQS", "NONE").upper()  # allow override
+        if ssl_cert_reqs_env == "REQUIRED":
+            cert_req = ssl.CERT_REQUIRED
+        elif ssl_cert_reqs_env == "OPTIONAL":
+            cert_req = ssl.CERT_OPTIONAL
+        else:
+            cert_req = ssl.CERT_NONE
 
-        # If user passed ssl_cert_reqs in query string, respect it:
-        qs = parse_qs(parsed.query)
-        v = qs.get("ssl_cert_reqs") or qs.get("ssl_cert_req")
-        if v:
-            # if user supplied CERT_REQUIRED/CERT_NONE etc -> map to bool
-            val = v[0].upper()
-            if val in ("CERT_NONE", "NONE", "0", "FALSE"):
-                broker_use_ssl = {"ssl_cert_reqs": False}
-            else:
-                # default to verify if they explicitly requested
-                broker_use_ssl = {"ssl_cert_reqs": True}
+        broker_use_ssl = {
+            "ssl_cert_reqs": cert_req,
+        }
 
-    if broker_use_ssl:
-        broker_opts["broker_use_ssl"] = broker_use_ssl
+    return broker_use_ssl
 
-    celery = Celery(
-        "visora",
-        broker=broker_url,
-        backend=backend_url or broker_url,
-        include=[],  # tasks will be autodiscovered
-    )
 
-    # Basic recommended conf
+def make_celery(app_name: str = "visora"):
+    """
+    Create and configure Celery instance.
+    Environment variables used:
+        REDIS_URL                  - full redis URL, e.g. rediss://default:...@host:6379
+        CELERY_BROKER_POOL_LIMIT   - optional
+        CELERY_TASK_SOFT_TIME_LIMIT - optional
+        CELERY_TASK_TIME_LIMIT     - optional
+        CELERY_CONCURRENCY         - optional (informational)
+        REDIS_SSL_CERT_REQS        - override: REQUIRED | OPTIONAL | NONE (default NONE)
+    """
+
+    redis_url = os.getenv("REDIS_URL", os.getenv("UPSTASH_REDIS_URL", None))
+    if not redis_url:
+        LOG.warning("No REDIS_URL provided; Celery will start without broker (LOCAL TEST MODE).")
+
+    broker_url = _normalize_redis_url(redis_url) if redis_url else None
+    result_backend = broker_url  # use same redis for results (common pattern)
+
+    broker_use_ssl = _ssl_config_from_url(redis_url)
+
+    # Create Celery
+    celery = Celery(app_name, broker=broker_url, backend=result_backend)
+
+    # Basic recommended configuration for production
     celery.conf.update(
-        task_serializer="json",
         accept_content=["json"],
+        task_serializer="json",
         result_serializer="json",
-        result_expires=3600,
-        timezone="UTC",
         enable_utc=True,
-        broker_transport_options={"visibility_timeout": 3600},
-        worker_prefetch_multiplier=1,
+        timezone="UTC",
+        worker_max_tasks_per_child=100,  # avoid memory leaks
+        worker_prefetch_multiplier=1,    # fair dispatch
         task_acks_late=True,
-        task_routes={
-            # default mapping: tasks.render_task.* -> queue 'renderers'
-            "tasks.render_task.*": {"queue": "renderers"},
-        },
-        worker_concurrency=int(os.environ.get("CELERY_CONCURRENCY", "1")),
-        **broker_opts,
+        task_reject_on_worker_lost=True,
+        broker_pool_limit=int(os.getenv("CELERY_BROKER_POOL_LIMIT", 10)),
+        task_soft_time_limit=int(os.getenv("CELERY_TASK_SOFT_TIME_LIMIT", 300)),  # seconds
+        task_time_limit=int(os.getenv("CELERY_TASK_TIME_LIMIT", 600)),  # seconds
+        task_track_started=True,
+        result_expires=int(os.getenv("CELERY_RESULT_EXPIRES", 60 * 60)),  # 1 hour
+        worker_concurrency=int(os.getenv("CELERY_CONCURRENCY", 4)),
     )
 
-    # autodiscover tasks in your project 'tasks' package
+    # Apply SSL settings for broker if needed
+    if broker_use_ssl:
+        # Celery expects broker_use_ssl (dict or list of dicts)
+        celery.conf.broker_use_ssl = broker_use_ssl
+        LOG.info("Configured broker_use_ssl: %s", broker_use_ssl)
+
+    # If Redis backend requires TLS options, Celery does not have direct backend_use_ssl
+    # but some versions accept result_backend_transport_options. For safety, try to set generic options.
+    if broker_use_ssl:
+        # Some transports use 'ssl' mapping, some use 'ssl_cert_reqs' directly. Provide both common options.
+        celery.conf.result_backend_transport_options = {
+            "ssl": {"cert_reqs": broker_use_ssl.get("ssl_cert_reqs")},
+            # fallback direct flag
+            "ssl_cert_reqs": broker_use_ssl.get("ssl_cert_reqs"),
+        }
+
+    # autodiscover tasks - adjust module list to your project structure
+    included_modules = [
+        "tasks.render_task",
+        "tasks.rendr_task",
+        "tasks.housekeeping",
+        # add other task modules here or set autodiscover to package 'tasks'
+    ]
+
+    # Use autodiscover from a package name; if your tasks are in `tasks` package, autodiscover that.
     try:
-        celery.autodiscover_tasks(["tasks"])
-    except Exception:
-        logger.warning("autodiscover_tasks failed; ensure tasks package exists")
+        celery.autodiscover_tasks(["tasks", "services"], force=True)
+    except Exception as ex:
+        LOG.warning("autodiscover_tasks() raised: %s. Proceeding — you can register tasks manually.", ex)
+
+    LOG.info("Celery app '%s' created. broker=%s", app_name, broker_url or "NONE")
 
     return celery
 
-# single module-level celery app
-celery = _make_celery(REDIS_URL, REDIS_URL)
 
-# Optional: integrate with Flask app context (call init_app(app) from your Flask factory)
-_flask_app = None
+# create a default celery instance for imports
+celery = make_celery("visora")
 
-class ContextTask(Task):
-    """Make Celery tasks run inside Flask app context if init_app was called."""
-    _app = None
-    abstract = True
+# Example: register a simple test task if needed (uncomment if you want quick smoke test)
+# @celery.task(name="visora.ping")
+# def ping():
+#     return "pong"
 
-    def __call__(self, *args, **kwargs):
-        if ContextTask._app:
-            with ContextTask._app.app_context():
-                return self.run(*args, **kwargs)
-        return self.run(*args, **kwargs)
-
-def init_app(app):
+# Optional helper: function to gracefully stop worker from code (if needed)
+def shutdown_workers():
     """
-    Call this from your Flask app (after creating Flask app) to integrate.
-    Example:
-        from services.celery_app import init_app, celery
-        init_app(app)
-        celery.start()  # or run workers separately
+    Request shutdown of workers via broadcast (if running).
+    Useful in integration scripts / tests.
     """
-    global _flask_app
-    _flask_app = app
-    ContextTask._app = app
-    celery.Task = ContextTask
-    logger.info("Celery integrated with Flask app context")
-
-# helper: simple decorator to register tasks easily (optional)
-def task(*args, **kwargs):
-    return celery.task(*args, **kwargs)
-
-# Example simple health-check task (you can remove)
-@celery.task(name="visora.ping")
-def ping():
-    logger.info("ping task executed")
-    return {"ok": True}
-
-# Optionally expose a convenience start for local dev (do not call in production gunicorn worker)
-def start_worker(argv=None):
-    """
-    Start a celery worker programmatically (useful for local debug).
-    Production: run `celery -A services.celery_app.celery worker ...` instead.
-    """
-    argv = argv or []
-    from celery.bin import worker as celery_worker
-    worker = celery_worker.worker(app=celery)
-    worker.run(argv=argv)
+    try:
+        celery.control.broadcast("shutdown")
+    except Exception as e:
+        LOG.exception("Error sending shutdown broadcast: %s", e)
