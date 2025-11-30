@@ -1,46 +1,46 @@
-from celery import Celery
+# services/celery_app.py
+"""
+Celery app initialization and helper to enqueue render jobs.
+"""
 import os
+import logging
+from celery import Celery
+from kombu import Exchange, Queue
 
-# ==========================
-# Redis URL from environment
-# ==========================
+logger = logging.getLogger("visora_celery")
+logging.basicConfig(level=logging.INFO)
 
-REDIS_URL = os.getenv("REDIS_URL")
+REDIS_URL = os.environ.get("REDIS_URL") or os.environ.get("CELERY_BROKER_URL") or os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
-if not REDIS_URL:
-    raise Exception("REDIS_URL environment variable not set!")
+celery_app = Celery("visora_tasks", broker=REDIS_URL, backend=REDIS_URL)
 
-# ==========================
-# Celery App
-# ==========================
-
-celery_app = Celery(
-    "visora",
-    broker=REDIS_URL,
-    backend=REDIS_URL,
-)
-
+# optional: configuration
 celery_app.conf.update(
-    broker_connection_retry_on_startup=True,
-    broker_transport_options={
-        "ssl": {
-            "cert_reqs": "CERT_NONE"
-        }
-    },
-    redis_backend_use_ssl={
-        "cert_reqs": "CERT_NONE"
-    },
     task_serializer="json",
-    accept_content=["json"],
     result_serializer="json",
-    timezone="Asia/Kolkata",
-    enable_utc=True,
+    accept_content=["json"],
+    worker_prefetch_multiplier=1,
+    task_acks_late=True,
 )
 
-# ==========================
-# Default task (for testing)
-# ==========================
+# define default queue
+celery_app.conf.task_default_queue = "celery"
+celery_app.conf.task_queues = (
+    Queue("celery", Exchange("celery"), routing_key="celery"),
+)
 
-@celery_app.task
-def test_task(text):
-    return f"Task completed: {text}"
+# import tasks to register them (relative import)
+try:
+    from tasks import render_task  # noqa: F401
+    logger.info("Imported tasks.render_task")
+except Exception:
+    logger.exception("Failed importing tasks.render_task")
+
+# helper to enqueue job by id
+def enqueue_render_job(job_id: str):
+    if not job_id:
+        raise ValueError("job_id required")
+    # call Celery task
+    result = celery_app.send_task("tasks.render_task.render_job_task", args=[job_id], queue="celery")
+    logger.info("Enqueued job %s -> %s", job_id, result.id)
+    return result.id

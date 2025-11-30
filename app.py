@@ -1,473 +1,271 @@
 # app.py
 """
-Production-ready Visora backend main app (single-file).
-Features implemented:
-- POST /create-video  -> create job immediately and return job_id (async)
-- GET  /render/start/<job_id> -> mark queued and enqueue celery worker
-- GET  /job/<job_id>  -> stable JSON {id,status,progress,video_url}
-- GET  /download/<job_id> -> serve final mp4 or return structured errors
-- GET  /health -> simple health check
-- Admin endpoints: /admin/jobs, /admin/queue, /admin/workers, /admin/clear-failed
-- CORS configured via env CORS_ORIGINS
-- Redis rediss:// handling (adds ssl_cert_reqs if needed)
-- Structured error handling, logging, file storage under ./public/videos
-- Optional S3 upload helper (upload_to_s3_if_configured)
-- Uses simple JSON "job files" in JOBS_DIR to persist state
-- Async behavior: create returns immediately; enqueue_render_job used to queue Celery task
+Main FastAPI backend for Visora-style video renderer.
+Provides:
+- POST /create-video  -> create job
+- GET  /job/{job_id}  -> job status/meta
+- GET  /download/{job_id} -> serve final mp4 or JSON with URL
+- Admin endpoints (protected by ADMIN_API_KEY)
 """
-
 import os
 import json
 import uuid
 import logging
 import traceback
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
+from fastapi import FastAPI, Request, HTTPException, Header, Depends
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from flask import Flask, request, jsonify, send_file, abort
-from flask_cors import CORS
-
-# ---------- CONFIG (env) ----------
+# config
 BASE_DIR = Path(__file__).resolve().parent
-JOBS_DIR = Path(os.environ.get("JOBS_DIR", str(BASE_DIR / "jobs")))
-OUTPUT_DIR = Path(os.environ.get("VIDEO_SAVE_DIR", str(BASE_DIR / "public" / "videos")))
+JOBS_DIR = BASE_DIR / "jobs"
+OUTPUT_DIR = BASE_DIR / "public" / "videos"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")  # e.g. https://visora-ai-yclw.onrender.com
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+BASE_URL = os.environ.get("BASE_URL", "https://example.com")
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-AWS_REGION = os.environ.get("AWS_REGION", "")
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+BACON_URL = os.environ.get("BACON_URL", "")
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
 
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "")  # comma separated
-ALLOWED_PRESETS = ["reel", "short", "cinematic"]
-
-# Redis / Celery config
-REDIS_URL = os.environ.get("REDIS_URL", os.environ.get("CELERY_BROKER_URL", ""))
-# Upstash / rediss often requires ssl_cert_reqs param in URL for some clients.
-# If scheme is rediss:// and url has no ssl_cert_reqs, append CERT_NONE to avoid validation errors in simple envs.
-if REDIS_URL.startswith("rediss://") and "ssl_cert_reqs" not in REDIS_URL:
-    # 注意: Upstash sometimes requires ?ssl_cert_reqs=CERT_NONE
-    connector = "&" if "?" in REDIS_URL else "?"
-    REDIS_URL = REDIS_URL + connector + "ssl_cert_reqs=CERT_NONE"
-
-# ---------- Logging ----------
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-logging.basicConfig(level=LOG_LEVEL)
+# logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("visora_app")
 
-# ---------- Flask app ----------
-app = Flask(__name__, static_folder=str(BASE_DIR / "public"))
-# configure CORS
-if CORS_ORIGINS:
-    origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
-else:
-    origins = ["*"]  # default allow all if not configured
-CORS(app, resources={r"/*": {"origins": origins, "methods": ["GET", "POST", "OPTIONS"]}})
-logger.info("CORS enabled for origins: %s", origins)
-
-# ---------- Celery enqueue function (optional) ----------
+# try to import enqueue function (Celery)
 enqueue_render_job = None
 try:
-    # Your services.queue should expose enqueue_render_job(job_id: str)
-    from services.queue import enqueue_render_job as _enqueue  # type: ignore
+    from services.celery_app import enqueue_render_job as _enqueue
     enqueue_render_job = _enqueue
-    logger.info("Loaded services.queue.enqueue_render_job")
+    logger.info("Loaded Celery enqueue function")
 except Exception:
-    logger.warning("services.queue.enqueue_render_job not found — background enqueue disabled")
+    logger.warning("Celery enqueue function not available; jobs will be created but not queued")
 
-# ---------- Job file helpers ----------
-def job_file_path(job_id: str) -> Path:
-    return JOBS_DIR / f"{job_id}.json"
+# utility Job model stored as JSON file
+class Job:
+    storage_dir = JOBS_DIR
 
-def read_job(job_id: str) -> Optional[Dict[str, Any]]:
-    p = job_file_path(job_id)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        logger.exception("Failed to read job file %s", p)
-        return None
+    def __init__(self, id: str, script_text: str = "", preset: str = "short", avatar=None,
+                 meta: Optional[dict] = None, result: Optional[dict] = None,
+                 status: str = "created", created_at: Optional[str] = None, completed_at: Optional[str] = None):
+        self.id = id
+        self.script_text = script_text
+        self.preset = preset
+        self.avatar = avatar
+        self.meta = meta or {}
+        self.result = result or {}
+        self.status = status
+        self.created_at = created_at
+        self.completed_at = completed_at
+        self.error = None
 
-def write_job(job: Dict[str, Any]):
-    p = job_file_path(job["id"])
-    try:
-        p.write_text(json.dumps(job, ensure_ascii=False, default=str), encoding="utf-8")
-    except Exception:
-        logger.exception("Failed to write job file %s", p)
+    @property
+    def path(self):
+        return self.storage_dir / f"{self.id}.json"
 
-def update_job_status(job_id: str, status: str, progress: Optional[int] = None, extra: Dict[str, Any] = None):
-    job = read_job(job_id) or {"id": job_id}
-    job["status"] = status
-    if progress is not None:
-        job["progress"] = int(progress)
-    job.setdefault("meta", {})
-    job["meta"]["last_update_at"] = datetime.now(timezone.utc).isoformat()
-    if extra:
-        job.setdefault("meta", {}).update(extra)
-    if status in ("completed", "failed"):
-        job["completed_at"] = datetime.now(timezone.utc).isoformat()
-    write_job(job)
-    logger.info("Job %s status -> %s (progress=%s)", job_id, status, job.get("progress"))
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "script_text": self.script_text,
+            "preset": self.preset,
+            "avatar": self.avatar,
+            "meta": self.meta,
+            "result": self.result,
+            "status": self.status,
+            "created_at": self.created_at,
+            "completed_at": self.completed_at,
+            "error": self.error
+        }
 
-def set_job_result(job_id: str, result: Dict[str, Any]):
-    job = read_job(job_id) or {"id": job_id}
-    job["result"] = result
-    job["status"] = "completed"
-    job["completed_at"] = datetime.now(timezone.utc).isoformat()
-    write_job(job)
-    logger.info("Job %s completed, result set", job_id)
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("Failed saving job")
+            raise
 
-def set_job_failed(job_id: str, error_msg: str):
-    job = read_job(job_id) or {"id": job_id}
-    job["status"] = "failed"
-    job["error"] = error_msg
-    job["completed_at"] = datetime.now(timezone.utc).isoformat()
-    write_job(job)
-    logger.error("Job %s failed: %s", job_id, error_msg)
+    @classmethod
+    def get(cls, id: str):
+        p = cls.storage_dir / f"{id}.json"
+        if not p.exists():
+            return None
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            job = Job(
+                id=data.get("id"),
+                script_text=data.get("script_text", ""),
+                preset=data.get("preset", "short"),
+                avatar=data.get("avatar"),
+                meta=data.get("meta", {}),
+                result=data.get("result", {}),
+                status=data.get("status", "created"),
+                created_at=data.get("created_at"),
+                completed_at=data.get("completed_at")
+            )
+            job.error = data.get("error")
+            return job
+        except Exception:
+            logger.exception("Failed reading job file")
+            return None
 
-# ---------- Utility: stable job response ----------
-def job_response(job_id: str) -> Dict[str, Any]:
-    job = read_job(job_id)
-    if not job:
-        return {"id": job_id, "status": "not_found", "progress": 0, "video_url": None}
-    # progress default 0..100
-    progress = int(job.get("progress", 0))
-    video_url = None
-    # If job has explicit result.video_url, use it
-    result = job.get("result") or {}
-    if isinstance(result, dict):
-        video_url = result.get("video_url")
-    # If not, attempt local public path
-    if not video_url:
-        out_local = OUTPUT_DIR / f"{job_id}.mp4"
-        if out_local.exists():
-            # If BASE_URL configured, expose stable path
-            if BASE_URL:
-                video_url = f"{BASE_URL}/videos/{job_id}.mp4"
-            else:
-                # fallback: server direct url path
-                video_url = f"/videos/{job_id}.mp4"
-    return {"id": job_id, "status": job.get("status", "created"), "progress": progress, "video_url": video_url}
+# import finalize helpers from tasks module (they update job)
+try:
+    from tasks.render_task import finalize_job_success, finalize_job_failed
+except Exception:
+    # define simple placeholders so API doesn't crash
+    def finalize_job_success(job_id: str, local_out: str):
+        logger.info("finalize_job_success placeholder called for %s", job_id)
+    def finalize_job_failed(job_id: str, error_msg: str):
+        logger.error("finalize_job_failed placeholder %s %s", job_id, error_msg)
 
-# ---------- Optional: S3 upload helper ----------
+# FastAPI app
+app = FastAPI(title="Visora Backend")
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# Request body model
+class CreateVideoRequest(BaseModel):
+    script: str
+    preset: Optional[str] = "short"
+    avatar: Optional[str] = None
+    meta: Optional[Dict] = {}
+
+# Utility: upload to S3 (optional)
 def upload_to_s3_if_configured(local_path: str, s3_key: str) -> Optional[str]:
-    if not (S3_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_REGION):
+    if not (S3_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+        logger.info("S3 not configured; skipping upload")
         return None
     try:
         import boto3
-        s3 = boto3.client("s3",
-                          aws_access_key_id=AWS_ACCESS_KEY_ID,
-                          aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                          region_name=AWS_REGION)
-        s3.upload_file(local_path, S3_BUCKET, s3_key)
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION,
+        )
+        s3.upload_file(local_path, S3_BUCKET, s3_key, ExtraArgs={"ACL": "public-read"})
         url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
-        logger.info("Uploaded %s -> s3://%s/%s", local_path, S3_BUCKET, s3_key)
+        logger.info("Uploaded to S3: %s", url)
         return url
     except Exception:
         logger.exception("S3 upload failed")
         return None
 
-# ---------- ROUTES ----------
-@app.route("/health", methods=["GET"])
-def health():
-    # lightweight health check (always ok even if workers busy)
-    return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
+# Health
+@app.get("/health")
+async def health():
+    return {"ok": True, "time": __import__("datetime").datetime.utcnow().isoformat(), "jobs_dir": str(JOBS_DIR), "output_dir": str(OUTPUT_DIR)}
 
-@app.route("/create-video", methods=["POST"])
-def create_video():
-    """
-    Create job endpoint: lightweight parsing only.
-    Returns immediately: {"ok": True, "job_id": "...", "status":"created", "warning": "..."}
-    """
+# Create video (public)
+@app.post("/create-video")
+async def create_video(body: CreateVideoRequest, request: Request):
     try:
-        data = request.get_json(force=True, silent=True)
-        if not data:
-            return jsonify({"error": "invalid_json", "message": "Invalid JSON payload"}), 400
+        data = body.dict()
+        script = data.get("script")
+        if not script or not script.strip():
+            raise HTTPException(status_code=400, detail="script is required")
 
-        script_text = data.get("script_text") or data.get("script") or ""
         preset = data.get("preset", "short")
-        avatar = data.get("avatar")  # optional avatar reference
+        avatar = data.get("avatar")
         meta = data.get("meta", {})
-        render_settings = data.get("render_settings", {})
-
-        if not script_text or not script_text.strip():
-            return jsonify({"error": "missing_script", "message": "script_text is required"}), 400
-
-        if preset not in ALLOWED_PRESETS:
-            preset = "short"
 
         jid = str(uuid.uuid4())
-        job = {
-            "id": jid,
-            "script_text": script_text,
-            "preset": preset,
-            "avatar": avatar,
-            "meta": meta,
-            "render_settings": render_settings,
-            "status": "created",
-            "progress": 0,
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
-        write_job(job)
+        job = Job(id=jid, script_text=script, preset=preset, avatar=avatar, meta=meta, status="created")
+        job.created_at = __import__("datetime").datetime.utcnow().isoformat()
+        job.save()
         logger.info("Created job %s preset=%s", jid, preset)
 
-        warning = None
-        enqueue_ok = False
-        if enqueue_render_job is not None:
+        # try enqueue
+        if enqueue_render_job:
             try:
-                enqueue_render_job(jid)  # attempt immediate enqueue
-                enqueue_ok = True
-                update_job_status(jid, "queued", progress=1)
-                logger.info("Enqueued job %s to background worker", jid)
+                enqueue_render_job(str(job.id))
             except Exception:
-                logger.exception("enqueue_render_job failed for %s", jid)
-                warning = "enqueue_failed"
+                logger.exception("enqueue_render_job failed")
+                # don't fail create; return created with warning
+                return JSONResponse(status_code=201, content={"ok": True, "job_id": jid, "status": "created", "warning": "enqueue_failed"})
         else:
-            warning = "enqueue_disabled"
+            logger.warning("No enqueue function configured")
 
-        resp = {"ok": True, "job_id": jid, "status": job["status"]}
-        if warning:
-            resp["warning"] = warning
-        # return 201
-        return jsonify(resp), 201
-
+        return JSONResponse(status_code=201, content={"ok": True, "job_id": jid, "status": "created"})
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("create_video failed")
-        return jsonify({"error": "create_failed", "message": str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route("/render/start/<job_id>", methods=["GET", "POST"])
-def start_render(job_id: str):
-    """
-    Manual start (admin optional). Marks job queued and enqueues celery task.
-    Prevents duplicate starts.
-    """
-    # optional admin protection
-    if ADMIN_API_KEY:
-        key = request.headers.get("x-api-key") or request.args.get("api_key")
-        if key != ADMIN_API_KEY:
-            return jsonify({"error": "unauthorized", "message": "Invalid admin api key"}), 401
+# Manual start (admin)
+def require_admin(x_api_key: Optional[str] = Header(None)):
+    if ADMIN_API_KEY and x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
 
-    job = read_job(job_id)
+@app.get("/render/start/{job_id}")
+async def start_render(job_id: str, admin: bool = Depends(require_admin)):
+    job = Job.get(job_id)
     if not job:
-        return jsonify({"error": "job_not_found", "message": "Job not found"}), 404
-
-    if job.get("status") in ("started", "queued", "processing"):
-        return jsonify({"error": "already_started", "message": "Job already started or queued."}), 400
-
-    job["status"] = "queued"
-    job.setdefault("meta", {})
-    job["meta"]["manually_started_at"] = datetime.now(timezone.utc).isoformat()
-    write_job(job)
-
-    if enqueue_render_job is None:
-        logger.warning("enqueue_render_job not configured; cannot queue job %s", job_id)
-        return jsonify({"ok": True, "job_id": job_id, "status": "queued", "warning": "enqueue_disabled"}), 200
-
-    try:
-        enqueue_render_job(job_id)
-        update_job_status(job_id, "queued", progress=1)
-        return jsonify({"ok": True, "job_id": job_id, "status": "queued"}), 200
-    except Exception:
-        logger.exception("Failed to enqueue job %s", job_id)
-        update_job_status(job_id, "created", extra={"enqueue_error": True})
-        return jsonify({"error": "enqueue_failed", "message": "Failed to add to queue"}), 500
-
-@app.route("/job/<job_id>", methods=["GET"])
-def job_status(job_id: str):
-    """
-    Return stable structure:
-    {id: ..., status: ..., progress: number, video_url: "..." }
-    """
-    try:
-        resp = job_response(job_id)
-        return jsonify(resp)
-    except Exception:
-        logger.exception("job_status error for %s", job_id)
-        return jsonify({"error": "internal", "message": "failed to fetch job status"}), 500
-
-@app.route("/download/<job_id>", methods=["GET"])
-def download(job_id: str):
-    """
-    Serve final mp4 if exists locally, else try job.result.video_url,
-    else structured error.
-    """
-    try:
-        job = read_job(job_id)
-        if not job:
-            return jsonify({"error": "job_not_found", "message": "Job not found"}), 404
-
-        # prefer explicit result url (S3 or absolute)
-        result = job.get("result", {}) or {}
-        if isinstance(result, dict) and result.get("video_url"):
-            # If video_url is an absolute URL, return JSON with that URL
-            url = result.get("video_url")
-            if url.startswith("http://") or url.startswith("https://"):
-                return jsonify({"video_url": url})
-            # else, if it's a relative path under public, try to serve
-            candidate = Path(url.lstrip("/"))
-            if candidate.exists():
-                return send_file(str(candidate), as_attachment=True)
-            # fallthrough to local file check
-
-        final_local = OUTPUT_DIR / f"{job_id}.mp4"
-        if final_local.exists():
-            # Serve file directly
-            return send_file(str(final_local), as_attachment=True)
-
-        # fallback: check public folder path
-        static_path = BASE_DIR / "public" / "videos" / f"{job_id}.mp4"
-        if static_path.exists():
-            return send_file(str(static_path), as_attachment=True)
-
-        # if job is still processing
-        if job.get("status") not in ("completed", "failed"):
-            return jsonify({"error": "processing", "message": "File is still processing", "status": job.get("status")}), 202
-
-        # final not found
-        return jsonify({"error": "not_found", "message": "Output file not found"}), 404
-
-    except Exception:
-        logger.exception("download error for %s", job_id)
-        return jsonify({"error": "internal", "message": "download failed"}), 500
-
-# ---------- Admin endpoints ----------
-def require_admin():
-    if not ADMIN_API_KEY:
-        abort(403, description="Admin API key not configured")
-    key = request.headers.get("x-api-key") or request.args.get("api_key")
-    if key != ADMIN_API_KEY:
-        abort(401, description="Unauthorized")
-
-@app.route("/admin/jobs", methods=["GET"])
-def admin_list_jobs():
-    try:
-        require_admin()
-        limit = int(request.args.get("limit", 200))
-        skip = int(request.args.get("skip", 0))
-        files = sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        items = []
-        for p in files[skip:skip+limit]:
-            try:
-                items.append(json.loads(p.read_text(encoding="utf-8")))
-            except Exception:
-                continue
-        return jsonify({"count": len(items), "jobs": items})
-    except Exception:
-        logger.exception("admin_list_jobs failed")
-        return jsonify({"error": "internal"}), 500
-
-@app.route("/admin/clear-failed", methods=["POST"])
-def admin_clear_failed():
-    try:
-        require_admin()
-        removed = []
-        for p in JOBS_DIR.glob("*.json"):
-            try:
-                j = json.loads(p.read_text(encoding="utf-8"))
-                if j.get("status") == "failed":
-                    # delete job json and out file
-                    out = OUTPUT_DIR / f"{j['id']}.mp4"
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
-                    if out.exists():
-                        try:
-                            out.unlink()
-                        except Exception:
-                            pass
-                    removed.append(j["id"])
-            except Exception:
-                continue
-        return jsonify({"ok": True, "removed": removed})
-    except Exception:
-        logger.exception("admin_clear_failed failed")
-        return jsonify({"error": "internal"}), 500
-
-@app.route("/admin/queue", methods=["GET"])
-def admin_queue_info():
-    try:
-        require_admin()
-        if enqueue_render_job is None:
-            return jsonify({"error": "queue_not_configured"}), 400
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status in ("started", "queued", "parsing"):
+        return {"error": "already_started", "message": "Job already started or queued."}
+    job.status = "queued"
+    job.save()
+    if enqueue_render_job:
         try:
-            # if services.celery_app.control.inspect available, return info
-            from services.celery_app import celery_app  # type: ignore
-            insp = celery_app.control.inspect()
-            return jsonify({
-                "active": insp.active() or {},
-                "reserved": insp.reserved() or {},
-                "scheduled": insp.scheduled() or {},
-                "registered": insp.registered() or {},
-            })
+            enqueue_render_job(job_id)
+            return {"ok": True, "job_id": job_id, "status": "queued"}
         except Exception:
-            logger.exception("Queue inspect failed")
-            return jsonify({"error": "inspect_failed"}), 500
-    except Exception:
-        logger.exception("admin_queue_info failed")
-        return jsonify({"error": "internal"}), 500
+            logger.exception("enqueue failed")
+            return {"ok": True, "job_id": job_id, "status": "queued", "warning": "enqueue_failed"}
+    else:
+        return {"ok": True, "job_id": job_id, "status": "queued", "warning": "no_enqueue"}
 
-@app.route("/admin/workers", methods=["GET"])
-def admin_workers():
-    try:
-        require_admin()
-        from services.celery_app import celery_app  # type: ignore
-        insp = celery_app.control.inspect()
-        return jsonify({"registered": insp.registered() or {}, "active": insp.active() or {}})
-    except Exception:
-        logger.exception("admin_workers failed")
-        return jsonify({"error": "internal"}), 500
+@app.get("/job/{job_id}")
+async def job_status(job_id: str):
+    job = Job.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job": job.to_dict()}
 
-# ---------- Cleanup job - utility route (admin) ----------
-@app.route("/admin/cleanup/<job_id>", methods=["POST"])
-def admin_cleanup_job(job_id: str):
-    try:
-        require_admin()
-        job_file = JOBS_DIR / f"{job_id}.json"
-        out_file = OUTPUT_DIR / f"{job_id}.mp4"
+@app.get("/download/{job_id}")
+async def download(job_id: str):
+    job = Job.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # prefer explicit url from job.result
+    if job.result and job.result.get("video_url"):
+        return {"video_url": job.result.get("video_url")}
+    # else check local file
+    final_local = OUTPUT_DIR / f"{job_id}.mp4"
+    if final_local.exists():
+        # serve file
+        return FileResponse(str(final_local), media_type="video/mp4", filename=f"{job_id}.mp4")
+    # fallback: public URL
+    public = f"{BASE_URL}/download/{job_id}.mp4"
+    return JSONResponse(status_code=404, content={"error": "Output not ready", "public_fallback": public})
+
+# Admin: list jobs
+@app.get("/admin/jobs")
+async def admin_list_jobs(admin: bool = Depends(require_admin)):
+    items = []
+    files = sorted(Job.storage_dir.glob("*.json"))
+    for p in files[:200]:
         try:
-            if job_file.exists():
-                job_file.unlink()
-            if out_file.exists():
-                out_file.unlink()
-            return jsonify({"ok": True})
-        except Exception as e:
-            logger.exception("cleanup failed")
-            return jsonify({"error": "cleanup_failed", "message": str(e)}), 500
-    except Exception:
-        logger.exception("admin_cleanup_job failed")
-        return jsonify({"error": "internal"}), 500
-
-# ---------- Error handlers (structured JSON) ----------
-@app.errorhandler(400)
-def bad_request(e):
-    return jsonify({"error": "bad_request", "message": str(e)}), 400
-
-@app.errorhandler(401)
-def unauthorized(e):
-    return jsonify({"error": "unauthorized", "message": str(e)}), 401
-
-@app.errorhandler(403)
-def forbidden(e):
-    return jsonify({"error": "forbidden", "message": str(e)}), 403
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({"error": "not_found", "message": str(e)}), 404
-
-@app.errorhandler(500)
-def internal_error(e):
-    # Log traceback
-    tb = traceback.format_exc()
-    logger.error("Unhandled exception: %s\n%s", e, tb)
-    return jsonify({"error": "internal", "message": "Internal server error"}), 500
-
-# ---------- Run ----------
-if __name__ == "__main__":
-    # For development only - use gunicorn in production with long timeout settings
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=(os.environ.get("FLASK_DEBUG") == "1"))
+            with open(p, "r", encoding="utf-8") as f:
+                items.append(json.load(f))
+        except Exception:
+            continue
+    return {"count": len(items), "jobs": items}
